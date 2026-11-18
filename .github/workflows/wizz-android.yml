@@ -71,8 +71,9 @@ jobs:
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
     - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60"
+        sudo apt-get $APT_OPTS update
+        sudo apt-get $APT_OPTS install -y \
              clang \
              cmake \
              curl \
@@ -98,7 +99,6 @@ jobs:
              llvm-dev \
              nasm \
              ninja-build \
-             openjdk-17-jdk-headless \
              pkg-config \
              tree \
              wget
@@ -208,13 +208,19 @@ jobs:
     - name: Build rustdesk
       shell: bash
       env:
-        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         WIZZ_KEYSTORE_B64: ${{ secrets.WIZZ_KEYSTORE_B64 }}
         WIZZ_KEYSTORE_PASSWORD: ${{ secrets.WIZZ_KEYSTORE_PASSWORD }}
         WIZZ_KEY_ALIAS: ${{ secrets.WIZZ_KEY_ALIAS }}
       run: |
-        export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+        # use the Java 17 that GitHub's runner already has (no 120 MB apt download)
+        if [ -z "$JAVA_HOME_17_X64" ] || [ ! -x "$JAVA_HOME_17_X64/bin/java" ]; then
+          echo "::error::Preinstalled Java 17 not found (JAVA_HOME_17_X64 is empty)"
+          exit 1
+        fi
+        export JAVA_HOME="$JAVA_HOME_17_X64"
+        export PATH="$JAVA_HOME/bin:$PATH"
+        java -version
         sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
         if [ -n "$WIZZ_KEYSTORE_B64" ]; then
           echo "$WIZZ_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/wizz.jks"
