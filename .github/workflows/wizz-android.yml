@@ -10,11 +10,38 @@ env:
   VERSION: 1.5.3
   NDK_VERSION: r28c
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      key: ${{ steps.k.outputs.key }}
+      hit: ${{ steps.c.outputs.cache-hit }}
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+    - name: Compute Rust cache key
+      id: k
+      shell: bash
+      run: |
+        echo "key=wizz-rustlib-aarch64-${{ hashFiles('src/**', 'libs/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', '.github/workflows/bridge.yml', 'flutter/build_android_deps.sh', 'flutter/ndk_arm64.sh') }}" >> "$GITHUB_OUTPUT"
+    - name: Look up cache
+      id: c
+      uses: actions/cache/restore@v4
+      with:
+        path: wizz-cache
+        key: ${{ steps.k.outputs.key }}
+        lookup-only: true
   generate-bridge:
+    needs:
+    - check
+    if: needs.check.outputs.hit != 'true'
     uses: ./.github/workflows/bridge.yml
   build:
     needs:
+    - check
     - generate-bridge
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.generate-bridge.result == 'success' || needs.generate-bridge.result == 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
     - name: Free Disk Space (Ubuntu)
@@ -66,6 +93,7 @@ jobs:
              pkg-config \
              tree \
              wget
+      timeout-minutes: 15
     - name: Checkout source code
       uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       with:
@@ -105,6 +133,12 @@ jobs:
         grep -n 'com.wizz.rustdesk' flutter/android/app/build.gradle
         grep -n 'RustDesk Wizz' flutter/android/app/src/main/AndroidManifest.xml
         git --no-pager diff
+    - name: Restore cached Rust library + bridge (skips the slow part)
+      id: wizzcache
+      uses: actions/cache/restore@v4
+      with:
+        path: wizz-cache
+        key: ${{ needs.check.outputs.key }}
     - name: Install flutter
       uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
       with:
@@ -127,24 +161,29 @@ jobs:
         vcpkgDirectory: /opt/artifacts/vcpkg
         vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
         doNotCache: false
+      if: steps.wizzcache.outputs.cache-hit != 'true'
     - name: Install vcpkg dependencies
       run: |
         ./flutter/build_android_deps.sh arm64-v8a
       shell: bash
+      if: steps.wizzcache.outputs.cache-hit != 'true'
     - name: Restore bridge files
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: bridge-artifact
         path: ./
+      if: steps.wizzcache.outputs.cache-hit != 'true'
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
       with:
         toolchain: ${{ env.RUST_VERSION }}
         components: rustfmt
+      if: steps.wizzcache.outputs.cache-hit != 'true'
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       with:
         prefix-key: rustdesk-lib-cache-android
         key: aarch64-linux-android
+      if: steps.wizzcache.outputs.cache-hit != 'true'
     - name: Build rustdesk lib
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -153,6 +192,30 @@ jobs:
         rustup target add aarch64-linux-android
         cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
         ./flutter/ndk_arm64.sh
+      if: steps.wizzcache.outputs.cache-hit != 'true'
+    - name: Store Rust library + bridge for next builds
+      if: steps.wizzcache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p wizz-cache
+        cp ./target/aarch64-linux-android/release/liblibrustdesk.so wizz-cache/
+        cp ./src/bridge_generated.rs ./src/bridge_generated.io.rs ./flutter/lib/generated_bridge.dart ./flutter/lib/generated_bridge.freezed.dart wizz-cache/
+        ls -la wizz-cache
+    - name: Save cache
+      if: steps.wizzcache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: wizz-cache
+        key: ${{ needs.check.outputs.key }}
+    - name: Use cached Rust library + bridge
+      if: steps.wizzcache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        mkdir -p ./target/aarch64-linux-android/release
+        cp wizz-cache/liblibrustdesk.so ./target/aarch64-linux-android/release/
+        cp wizz-cache/bridge_generated.rs wizz-cache/bridge_generated.io.rs ./src/
+        cp wizz-cache/generated_bridge.dart wizz-cache/generated_bridge.freezed.dart ./flutter/lib/
+        echo "Reusing cached Rust library and bridge"
     - name: Build rustdesk
       shell: bash
       env:
