@@ -78,17 +78,27 @@ jobs:
         python3 - <<'PYEOF'
         p = 'flutter/lib/models/model.dart'
         s = open(p).read()
-        a = 'return min(xscale, yscale) / 1.5;'
-        assert s.count(a) == 1
-        s = s.replace(a, 'return min(xscale, yscale);')
-        b = '    _y = focalPoint.dy - adjust - (focalPoint.dy - _y - adjust) / s * _scale;\n'
-        assert s.count(b) == 1
-        c = ('    final vs = getSize();\n'
-             '    final dw = getDisplayWidth() * _scale;\n'
-             '    final dh = getDisplayHeight() * _scale;\n'
-             '    if (dw <= vs.width) _x = (vs.width - dw) / 2;\n'
-             '    if (dh <= vs.height) _y = (vs.height - dh) / 2;\n')
-        s = s.replace(b, b + c)
+        def rep(a, b):
+            global s
+            assert s.count(a) == 1, a
+            s = s.replace(a, b)
+        # zoom-out stops when the remote screen fills the whole view (like AnyDesk)
+        rep('return min(xscale, yscale) / 1.5;', 'return max(xscale, yscale);')
+        # keep the view inside the remote screen when panning (no black edges)
+        rep('  panX(double dx) {\n    _x += dx;\n', '  panX(double dx) {\n    _x += dx;\n    if (isMobile) _wizzClampOffset();\n')
+        rep('  panY(double dy) {\n    _y += dy;\n', '  panY(double dy) {\n    _y += dy;\n    if (isMobile) _wizzClampOffset();\n')
+        rep('    _y = focalPoint.dy - adjust - (focalPoint.dy - _y - adjust) / s * _scale;\n',
+            '    _y = focalPoint.dy - adjust - (focalPoint.dy - _y - adjust) / s * _scale;\n    _wizzClampOffset();\n')
+        rep('  // mobile only\n  updateScale(', '''  void _wizzClampOffset() {
+            final vs = getSize();
+            final dw = getDisplayWidth() * _scale;
+            final dh = getDisplayHeight() * _scale;
+            _x = dw > vs.width ? _x.clamp(vs.width - dw, 0.0).toDouble() : (vs.width - dw) / 2;
+            _y = dh > vs.height ? _y.clamp(vs.height - dh, 0.0).toDouble() : (vs.height - dh) / 2;
+          }
+
+          // mobile only
+          updateScale(''')
         open(p, 'w').write(s)
         PYEOF
         grep -n 'com.wizz.rustdesk' flutter/android/app/build.gradle
