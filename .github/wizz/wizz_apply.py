@@ -25,6 +25,19 @@ zrep('  // mobile only\n  updateScale(', '''  void _wizzClampOffset() {
   updateScale(''')
 open(p, 'w').write(s)
 
+# ===== Wizz: Ctrl+A (select all) next to Ctrl+C in the extra keys row =====
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = open(p).read()
+zrep("""      wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
+        sendPrompt(isMac, 'VK_C');
+      }),""", """      wrap(isMac ? 'Cmd+A' : 'Ctrl+A', () {
+        sendPrompt(isMac, 'VK_A');
+      }),
+      wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
+        sendPrompt(isMac, 'VK_C');
+      }),""")
+open(p, 'w').write(s)
+
 # ===== Wizz: multi-session =====
 import os, re, sys
 
