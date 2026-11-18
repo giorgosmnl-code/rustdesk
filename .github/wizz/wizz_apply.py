@@ -571,6 +571,62 @@ s = slice_replace(s, 'void sendPrompt(', 'class FABLocation', 'gFFI', 'wffi')
 s = rep(s, "  final wffi = ffi ?? wffi;\n", "  final wffi = ffi ?? gFFI;\n")
 save(p, s)
 
+# ------------------------------------------- clipboard only on the visible PC
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+# returning to the app: only the visible PC checks the phone clipboard
+s = rep(s, """    if (state == AppLifecycleState.resumed) {
+      trySyncClipboard();""", """    if (state == AppLifecycleState.resumed) {
+      if (!widget.active) return;
+      trySyncClipboard();""")
+# background PCs get their clipboard switched off, the visible one back on.
+# A local flag remembers which PCs Wizz switched off, so a manual
+# "Disable clipboard" stays as the user set it and a crash is undone next time.
+s = rep(s, """  @override
+  void didUpdateWidget(covariant RemotePage oldWidget) {""", """  String get _wizzClipKey => 'wizz-clipoff-${widget.id}';
+
+  Future<void> _wizzSetClipboard(bool on) async {
+    final off = bind.sessionGetToggleOptionSync(
+        sessionId: sessionId, arg: 'disable-clipboard');
+    if (on) {
+      if (off && bind.mainGetLocalOption(key: _wizzClipKey) == 'Y') {
+        await bind.sessionToggleOption(
+            sessionId: sessionId, value: 'disable-clipboard');
+      }
+      await bind.mainSetLocalOption(key: _wizzClipKey, value: '');
+    } else if (!off) {
+      await bind.mainSetLocalOption(key: _wizzClipKey, value: 'Y');
+      await bind.sessionToggleOption(
+          sessionId: sessionId, value: 'disable-clipboard');
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant RemotePage oldWidget) {""")
+s = rep(s, """      // copy on one PC, switch, paste on the other
+      _ffi.invokeMethod("wizz_force_sync_clipboard");""", """      // copy on one PC, switch, paste on the other
+      () async {
+        await _wizzSetClipboard(true);
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (mounted && widget.active) {
+          _ffi.invokeMethod("wizz_force_sync_clipboard");
+        }
+      }();""")
+s = rep(s, """      _ffi.dialogManager.hideMobileActionsOverlay(store: false);
+    }
+  }""", """      _ffi.dialogManager.hideMobileActionsOverlay(store: false);
+      _wizzSetClipboard(false);
+    }
+  }""")
+# a new connection undoes a switch-off left over from before
+s = rep(s, """      forceRelay: widget.forceRelay,
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {""", """      forceRelay: widget.forceRelay,
+    );
+    _wizzSetClipboard(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {""")
+save(p, s)
+
 # ----------------------------------------------------------------- common.dart
 p = 'flutter/lib/common.dart'
 s = load(p)
