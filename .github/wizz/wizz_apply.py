@@ -638,6 +638,32 @@ s = rep(s, """      forceRelay: widget.forceRelay,
     );
     _wizzSetClipboard(true);
     WidgetsBinding.instance.addPostFrameCallback((_) {""")
+# bottom bar: with the extra sessions button the icons no longer fit on
+# narrow phones, so the left group shrinks a little instead of being cut off
+s = rep(s, """        children: <Widget>[
+          Row(
+              children: <Widget>[
+                    IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.clear),""", """        children: <Widget>[
+          Expanded(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Row(
+              children: <Widget>[
+                    IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.clear),""")
+s = rep(s, """                  ]),
+          Obx(() => IconButton(
+                color: Colors.white,
+                icon: Icon(Icons.expand_more),""", """                  ]),
+            ),
+          ),
+          Obx(() => IconButton(
+                color: Colors.white,
+                icon: Icon(Icons.expand_more),""")
 save(p, s)
 
 # ----------------------------------------------------------------- common.dart
