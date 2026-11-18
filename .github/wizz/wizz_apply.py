@@ -498,6 +498,8 @@ s = rep(s, "  @override\n  Future<void> dispose() async {\n", """  @override
       _ffi.ffiModel.updateEventListener(sessionId, widget.id);
       _physicalFocusNode.requestFocus();
       _ffi.canvasModel.updateViewStyle();
+      // copy on one PC, switch, paste on the other
+      _ffi.invokeMethod("wizz_force_sync_clipboard");
     } else {
       _showEdit = false;
       _mobileFocusNode.unfocus();
@@ -633,6 +635,27 @@ s = rep(s, """      SessionID sessionId, String type, String title, String text)
     onClose() {
       closeConnection(sessionId: sessionId);
     }""")
+save(p, s)
+
+# ------------------------------------------------- clipboard between sessions
+p = 'flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/RdClipboardManager.kt'
+s = load(p)
+s = rep(s, "    fun syncClipboard(isClient: Boolean) {\n",
+        "    // Wizz: send the phone clipboard to the PCs even if it came from a PC\n"
+        "    fun wizzForceSyncClient() {\n"
+        "        lastUpdatedClipData = null\n"
+        "        syncClipboard(true)\n"
+        "    }\n\n"
+        "    fun syncClipboard(isClient: Boolean) {\n")
+save(p, s)
+p = 'flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainActivity.kt'
+s = load(p)
+s = rep(s, '                "try_sync_clipboard" -> {\n',
+        '                "wizz_force_sync_clipboard" -> {\n'
+        '                    rdClipboardManager?.wizzForceSyncClient()\n'
+        '                    result.success(true)\n'
+        '                }\n'
+        '                "try_sync_clipboard" -> {\n')
 save(p, s)
 
 # ---------------------------------------------------------- new session file
