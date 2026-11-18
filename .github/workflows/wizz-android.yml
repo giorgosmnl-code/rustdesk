@@ -1,6 +1,15 @@
 name: Wizz Android APK
+run-name: ${{ inputs.variant }} APK
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: App to build
+        type: choice
+        options:
+        - multiview
+        - wizz
+        default: multiview
 env:
   RUST_VERSION: '1.75'
   CARGO_NDK_VERSION: 3.1.2
@@ -100,12 +109,19 @@ jobs:
         submodules: recursive
     - name: Apply Wizz changes (zoom limit, multi-session, app id)
       shell: bash
+      env:
+        WIZZ_VARIANT: ${{ inputs.variant }}
       run: |
-        sed -i 's/applicationId "com.carriez.flutter_hbb"/applicationId "com.wizz.rustdesk"/' flutter/android/app/build.gradle
-        sed -i 's/android:label="RustDesk"$/android:label="RustDesk Wizz"/' flutter/android/app/src/main/AndroidManifest.xml
+        if [ "$WIZZ_VARIANT" = "wizz" ]; then
+          APPID=com.wizz.rustdesk; LABEL="RustDesk Wizz"; export WIZZ_MULTI=0
+        else
+          APPID=com.wizz.rustdesk.multiview; LABEL="RustDesk Multiview"; export WIZZ_MULTI=1
+        fi
+        sed -i "s/applicationId \"com.carriez.flutter_hbb\"/applicationId \"$APPID\"/" flutter/android/app/build.gradle
+        sed -i "s/android:label=\"RustDesk\"\$/android:label=\"$LABEL\"/" flutter/android/app/src/main/AndroidManifest.xml
         python3 .github/wizz/wizz_apply.py
-        grep -n 'com.wizz.rustdesk' flutter/android/app/build.gradle
-        grep -n 'RustDesk Wizz' flutter/android/app/src/main/AndroidManifest.xml
+        grep -n "applicationId \"$APPID\"" flutter/android/app/build.gradle
+        grep -n "android:label=\"$LABEL\"" flutter/android/app/src/main/AndroidManifest.xml
         git --no-pager diff --stat
     - name: Restore cached Rust library + bridge (skips the slow part)
       id: wizzcache
@@ -214,9 +230,9 @@ jobs:
         cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
         cd flutter
         flutter build apk --release --target-platform android-arm64 --split-per-abi
-        mkdir -p ../out && cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../out/rustdesk-wizz-${{ env.VERSION }}-arm64.apk
+        mkdir -p ../out && cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../out/rustdesk-${{ inputs.variant }}-${{ env.VERSION }}-arm64.apk
     - name: Upload APK
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: rustdesk-wizz-apk
+        name: rustdesk-${{ inputs.variant }}-apk
         path: out/*.apk
