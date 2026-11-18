@@ -28,6 +28,10 @@ open(p, 'w').write(s)
 # ===== Wizz: multi-session =====
 import os, re, sys
 
+if os.environ.get('WIZZ_MULTI', '1') != '1':
+    print('multi-session skipped (WIZZ_MULTI != 1)')
+    raise SystemExit(0)
+
 WIZZ_SESSIONS_DART = r'''// Wizz: multiple remote sessions (up to kWizzMaxSessions) on mobile.
 // Each session gets its own FFI; the first one reuses gFFI so that
 // features which still use the global model (chat etc.) keep working there.
