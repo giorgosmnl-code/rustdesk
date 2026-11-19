@@ -45,7 +45,7 @@ if os.environ.get('WIZZ_MULTI', '1') != '1':
     print('multi-session skipped (WIZZ_MULTI != 1)')
     raise SystemExit(0)
 
-WIZZ_SESSIONS_DART = r'''// Wizz: multiple remote sessions (up to kWizzMaxSessions) on mobile.
+WIZZ_SESSIONS_DART = r'''// Wizz: multiple remote sessions on mobile (no limit).
 // Each session gets its own FFI; the first one reuses gFFI so that
 // features which still use the global model (chat etc.) keep working there.
 import 'package:flutter/material.dart';
@@ -59,7 +59,6 @@ import '../../models/model.dart';
 import '../../models/state_model.dart';
 import 'remote_page.dart';
 
-const int kWizzMaxSessions = 3;
 
 class WizzSession {
   final String id;
@@ -129,10 +128,6 @@ class WizzSessions {
     if (existing >= 0) {
       current.value = existing;
       return true;
-    }
-    if (sessions.length >= kWizzMaxSessions) {
-      showToast('Maximum $kWizzMaxSessions PCs open. Close one first.');
-      return false;
     }
     sessions.add(WizzSession(id, _allocFfi(),
         loginMethod: loginMethod,
@@ -224,6 +219,8 @@ void wizzConnectMobile(BuildContext context, String id,
       password: password,
       isSharedPassword: isSharedPassword,
       forceRelay: forceRelay);
+  // counts as open right away, so the next PC of a multi-connect joins it
+  m.hostMounted = true;
   Navigator.push(
     context,
     MaterialPageRoute(builder: (BuildContext context) => WizzRemoteHost()),
@@ -314,10 +311,14 @@ void showWizzSessionsMenu(BuildContext context) {
               padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
               child: Align(
                 alignment: Alignment.centerLeft,
-                child: Text('Open PCs (${list.length}/$kWizzMaxSessions)',
+                child: Text('Open PCs (${list.length})',
                     style: const TextStyle(fontWeight: FontWeight.bold)),
               ),
             ),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
             for (var i = 0; i < list.length; i++)
               ListTile(
                 leading: Icon(i == cur
@@ -339,21 +340,17 @@ void showWizzSessionsMenu(BuildContext context) {
                   },
                 ),
               ),
-            if (list.length < kWizzMaxSessions)
-              ListTile(
-                leading: const Icon(Icons.add),
-                title: const Text('Connect another PC'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  showWizzConnectDialog(context);
-                },
-              )
-            else
-              const ListTile(
-                enabled: false,
-                leading: Icon(Icons.block),
-                title: Text('Maximum $kWizzMaxSessions PCs open'),
+                ],
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('Connect more PCs'),
+              onTap: () {
+                Navigator.pop(ctx);
+                showWizzConnectDialog(context);
+              },
+            ),
           ],
         );
       }),
@@ -361,41 +358,70 @@ void showWizzSessionsMenu(BuildContext context) {
   );
 }
 
+/// Connects several PCs one after another; the first one picked is shown.
+Future<void> wizzConnectMany(BuildContext context, List<String> ids) async {
+  final m = WizzSessions.to;
+  final todo = <String>[];
+  for (final id in ids) {
+    if (id.isNotEmpty && !todo.contains(id)) todo.add(id);
+  }
+  if (todo.isEmpty) return;
+  for (final id in todo) {
+    await connect(context, id);
+  }
+  final first = m.sessions.indexWhere((s) => s.id == todo.first);
+  if (first >= 0) m.switchTo(first);
+}
+
+/// Pick one or more PCs: tap recent ones to select them and/or type IDs
+/// (several IDs separated by commas).
 void showWizzConnectDialog(BuildContext context) {
   final m = WizzSessions.to;
+  final inRemote = m.hostMounted;
   final ctrl = TextEditingController();
-  final open = m.sessions.map((s) => s.id).toSet();
+  final open = inRemote ? m.sessions.map((s) => s.id).toSet() : <String>{};
   final recent = gFFI.recentPeersModel.peers
       .map((p) => p.id)
       .where((id) => !open.contains(id))
-      .take(6)
+      .take(8)
       .toList();
+  final picked = <String>[];
   // The remote page turns the Android soft keyboard off; we need it here.
-  gFFI.invokeMethod("enable_soft_keyboard", true);
+  if (inRemote) gFFI.invokeMethod("enable_soft_keyboard", true);
   var started = false;
+  List<String> typed() => ctrl.text
+      .split(RegExp(r'[,;\n]'))
+      .map((e) => e.replaceAll(' ', '').trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
   showDialog(
     context: context,
-    builder: (ctx) {
-      void go(String raw) {
-        final id = raw.replaceAll(' ', '').trim();
-        if (id.isEmpty) return;
+    builder: (ctx) => StatefulBuilder(builder: (ctx, setState) {
+      final all = <String>[...picked];
+      for (final id in typed()) {
+        if (!all.contains(id)) all.add(id);
+      }
+      void go() {
+        if (all.isEmpty) return;
         started = true;
         Navigator.pop(ctx);
-        connect(context, id);
+        wizzConnectMany(context, all);
       }
 
       return AlertDialog(
-        title: const Text('Connect another PC'),
+        title: Text(inRemote ? 'Connect more PCs' : 'Connect several PCs'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             TextField(
               controller: ctrl,
-              autofocus: true,
-              decoration: const InputDecoration(hintText: 'Remote ID'),
+              autofocus: recent.isEmpty,
+              decoration: const InputDecoration(
+                  hintText: 'Remote ID (several: 123, 456)'),
               textInputAction: TextInputAction.go,
-              onSubmitted: go,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => go(),
             ),
             if (recent.isNotEmpty) const SizedBox(height: 12),
             if (recent.isNotEmpty)
@@ -404,7 +430,17 @@ void showWizzConnectDialog(BuildContext context) {
                 runSpacing: 6,
                 children: [
                   for (final id in recent)
-                    ActionChip(label: Text(id), onPressed: () => go(id)),
+                    FilterChip(
+                      label: Text(id),
+                      selected: picked.contains(id),
+                      onSelected: (on) => setState(() {
+                        if (on) {
+                          picked.add(id);
+                        } else {
+                          picked.remove(id);
+                        }
+                      }),
+                    ),
                 ],
               ),
           ],
@@ -415,14 +451,16 @@ void showWizzConnectDialog(BuildContext context) {
             child: const Text('Cancel'),
           ),
           ElevatedButton(
-            onPressed: () => go(ctrl.text),
-            child: const Text('Connect'),
+            onPressed: all.isEmpty ? null : go,
+            child: Text(all.length > 1 ? 'Connect ${all.length}' : 'Connect'),
           ),
         ],
       );
-    },
+    }),
   ).then((_) {
-    if (!started) gFFI.invokeMethod("enable_soft_keyboard", false);
+    if (inRemote && !started) {
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+    }
   });
 }
 '''
@@ -596,21 +634,54 @@ s = rep(s, """    if (state == AppLifecycleState.resumed) {
 # A local flag remembers which PCs Wizz switched off, so a manual
 # "Disable clipboard" stays as the user set it and a crash is undone next time.
 s = rep(s, """  @override
-  void didUpdateWidget(covariant RemotePage oldWidget) {""", """  String get _wizzClipKey => 'wizz-clipoff-${widget.id}';
+  void didUpdateWidget(covariant RemotePage oldWidget) {""", """  // Background PCs: clipboard off, sound off and 1 frame per second; the
+  // visible PC gets everything back. Local flags remember what Wizz changed,
+  // so the user's own settings stay and a crash is undone on the next connect.
+  String _wizzKey(String what) => 'wizz-bg-$what-${widget.id}';
 
-  Future<void> _wizzSetClipboard(bool on) async {
-    final off = bind.sessionGetToggleOptionSync(
-        sessionId: sessionId, arg: 'disable-clipboard');
-    if (on) {
-      if (off && bind.mainGetLocalOption(key: _wizzClipKey) == 'Y') {
-        await bind.sessionToggleOption(
-            sessionId: sessionId, value: 'disable-clipboard');
+  Future<void> _wizzSetOff(String option, bool off) async {
+    final key = _wizzKey(option);
+    final isOff =
+        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
+    if (off) {
+      if (!isOff) {
+        await bind.mainSetLocalOption(key: key, value: 'Y');
+        await bind.sessionToggleOption(sessionId: sessionId, value: option);
       }
-      await bind.mainSetLocalOption(key: _wizzClipKey, value: '');
-    } else if (!off) {
-      await bind.mainSetLocalOption(key: _wizzClipKey, value: 'Y');
-      await bind.sessionToggleOption(
-          sessionId: sessionId, value: 'disable-clipboard');
+    } else {
+      if (isOff && bind.mainGetLocalOption(key: key) == 'Y') {
+        await bind.sessionToggleOption(sessionId: sessionId, value: option);
+      }
+      await bind.mainSetLocalOption(key: key, value: '');
+    }
+  }
+
+  // calls run one after another so quick switches can't mix up the flags
+  Future<void> _wizzBgQueue = Future.value();
+  Future<void> _wizzBackground(bool bg) {
+    _wizzBgQueue = _wizzBgQueue
+        .then((_) => _wizzSetBackground(bg))
+        .catchError((e) => debugPrint('wizz background: $e'));
+    return _wizzBgQueue;
+  }
+
+  Future<void> _wizzSetBackground(bool bg) async {
+    await _wizzSetOff('disable-clipboard', bg);
+    await _wizzSetOff('disable-audio', bg);
+    final fpsKey = _wizzKey('fps');
+    final saved = bind.mainGetLocalOption(key: fpsKey);
+    if (bg) {
+      if (saved.isEmpty) {
+        final cur =
+            await bind.sessionGetOption(sessionId: sessionId, arg: 'custom-fps');
+        await bind.mainSetLocalOption(
+            key: fpsKey, value: (cur == null || cur.isEmpty) ? '30' : cur);
+      }
+      await bind.sessionSetCustomFps(sessionId: sessionId, fps: 1);
+    } else if (saved.isNotEmpty) {
+      await bind.sessionSetCustomFps(
+          sessionId: sessionId, fps: int.tryParse(saved) ?? 30);
+      await bind.mainSetLocalOption(key: fpsKey, value: '');
     }
   }
 
@@ -619,7 +690,9 @@ s = rep(s, """  @override
 s = rep(s, """      // copy on one PC, switch, paste on the other
       _ffi.invokeMethod("wizz_force_sync_clipboard");""", """      // copy on one PC, switch, paste on the other
       () async {
-        await _wizzSetClipboard(true);
+        await _wizzBackground(false);
+        // fresh picture right away instead of the last 1 fps frame
+        sessionRefreshVideo(sessionId, _ffi.ffiModel.pi);
         await Future.delayed(const Duration(milliseconds: 300));
         if (mounted && widget.active) {
           _ffi.invokeMethod("wizz_force_sync_clipboard");
@@ -628,7 +701,7 @@ s = rep(s, """      // copy on one PC, switch, paste on the other
 s = rep(s, """      _ffi.dialogManager.hideMobileActionsOverlay(store: false);
     }
   }""", """      _ffi.dialogManager.hideMobileActionsOverlay(store: false);
-      _wizzSetClipboard(false);
+      _wizzBackground(true);
     }
   }""")
 # a new connection undoes a switch-off left over from before
@@ -636,7 +709,12 @@ s = rep(s, """      forceRelay: widget.forceRelay,
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {""", """      forceRelay: widget.forceRelay,
     );
-    _wizzSetClipboard(true);
+    _wizzBackground(false);
+    // a PC opened in the background (multi-connect) only gets the settings
+    // once it is connected, so apply them again on its first picture
+    _ffi.imageModel.addCallbackOnFirstImage((_) {
+      if (mounted && !widget.active) _wizzBackground(true);
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {""")
 # bottom bar: with the extra sessions button the icons no longer fit on
 # narrow phones, so the left group shrinks a little instead of being cut off
@@ -664,6 +742,38 @@ s = rep(s, """                  ]),
           Obx(() => IconButton(
                 color: Colors.white,
                 icon: Icon(Icons.expand_more),""")
+save(p, s)
+
+# ------------------------------------------------ connect several PCs at once
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, ".showLoading(translate('Connecting...'), onCancel: closeConnection);",
+        ".showLoading(translate('Connecting...'),\n              onCancel: () => closeConnection(sessionId: sessionId));")
+save(p, s)
+# home screen: long-press PCs (any tab, address book included), then Connect
+p = 'flutter/lib/common/widgets/peer_tab_page.dart'
+s = load(p)
+s = rep(s, "import '../../common.dart';\n",
+        "import '../../common.dart';\nimport '../../mobile/pages/wizz_sessions.dart';\n")
+s = rep(s, """          child: Row(
+            children: [
+              deleteSelection(),""", """          child: Row(
+            children: [
+              if (isMobile) wizzConnectSelection(model),
+              deleteSelection(),""")
+s = rep(s, """  Widget closeSelection() {""", """  Widget wizzConnectSelection(PeerTabModel model) {
+    return _hoverAction(
+        context: context,
+        toolTip: translate('Connect'),
+        onTap: () {
+          final ids = model.selectedPeers.map((e) => e.id).toList();
+          model.setMultiSelectionMode(false);
+          wizzConnectMany(context, ids);
+        },
+        child: Icon(Icons.play_arrow, color: MyTheme.accent));
+  }
+
+  Widget closeSelection() {""")
 save(p, s)
 
 # ----------------------------------------------------------------- common.dart
