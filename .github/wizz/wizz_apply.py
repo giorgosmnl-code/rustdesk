@@ -815,7 +815,22 @@ s = rep(s, """      forceRelay: widget.forceRelay,
     // a PC opened in the background (multi-connect) only gets the settings
     // once it is connected, so apply them again on its first picture
     _ffi.imageModel.addCallbackOnFirstImage((_) {
-      if (mounted && !widget.active) _wizzBackground(true);
+      if (!mounted) return;
+      if (!widget.active) {
+        _wizzBackground(true);
+        return;
+      }
+      // a PC opened after something was copied elsewhere: offer it here too
+      Future.delayed(const Duration(milliseconds: 500), () async {
+        if (!mounted || !widget.active) return;
+        await wizzTakeSharedFiles();
+        final code = _wizzClipCall('wizz-clip-offer');
+        if (code == '1') {
+          showToast('Copied files are ready here: paste with Ctrl+V');
+        } else if (code == '0') {
+          _ffi.invokeMethod("wizz_force_sync_clipboard");
+        }
+      });
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {""")
 # bottom bar: with the extra sessions button the icons no longer fit on
