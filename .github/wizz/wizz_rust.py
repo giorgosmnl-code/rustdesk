@@ -682,6 +682,48 @@ pub fn offer(sid: u64) -> (&'static str, Option<Message>) {
     ("1", Some(wrap(cliprdr::Union::FormatList(list))))
 }
 
+fn add_phone_entry(path: &Path, rel: String, out: &mut Vec<LocalFile>) {
+    if path.is_dir() {
+        out.push(LocalFile { name: rel.clone(), path: path.to_path_buf(), size: 0, dir: true });
+        if let Ok(rd) = std::fs::read_dir(path) {
+            let mut kids: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            kids.sort();
+            for k in kids {
+                if let Some(n) = k.file_name().map(|n| n.to_string_lossy().to_string()) {
+                    add_phone_entry(&k, format!("{rel}/{n}"), out);
+                }
+            }
+        }
+    } else if let Ok(m) = std::fs::metadata(path) {
+        out.push(LocalFile { name: rel, path: path.to_path_buf(), size: m.len(), dir: false });
+    }
+}
+
+/// Files picked or shared on the phone: they become the latest copy, ready to
+/// paste on a PC. Returns how many top-level items were added.
+pub fn set_phone_files(paths: &[String]) -> usize {
+    let mut files = Vec::new();
+    let mut n = 0;
+    for p in paths {
+        let path = PathBuf::from(p);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if safe_name(&name).is_none() {
+            continue;
+        }
+        add_phone_entry(&path, name, &mut files);
+        n += 1;
+    }
+    if files.is_empty() {
+        return 0;
+    }
+    let pdu = build_pdu(&files);
+    *local().lock().unwrap() = Some(Local { src: 0, files, pdu });
+    set_latest(Latest::Local);
+    n
+}
+
 /// Deletes the files last downloaded from the PC of session `sid`.
 pub fn delete_saved(sid: u64) {
     let saved = {
@@ -893,6 +935,14 @@ fn wizz_clip_common(s: &flutter::FlutterSession, key: &str, param: &str) -> Stri
                 crate::client::Interface::send(&**s, crate::client::Data::Message(m));
             }
             code.to_owned()
+        }
+        "wizz-clip-phone-files" => {
+            let paths: Vec<String> = param
+                .split('\n')
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_owned())
+                .collect();
+            crate::wizz_file_clip::set_phone_files(&paths).to_string()
         }
         "wizz-clip-delete" => {
             crate::wizz_file_clip::delete_saved(sid);
