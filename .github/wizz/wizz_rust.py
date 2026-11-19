@@ -862,7 +862,7 @@ s = rep(s, "                Some(message::Union::FileResponse(fr)) => {\n",
         "                        let sid = self.handler.lc.read().unwrap().session_id;\n"
         "                        if !crate::wizz_file_clip::has_sender(sid) {\n"
         "                            let h = self.handler.clone();\n"
-        "                            crate::wizz_file_clip::register_sender(sid, Box::new(move |m| {\n"
+        "                            crate::wizz_file_clip::register_sender(sid, Box::new(move |m: Message| {\n"
         "                                Interface::send(&h, Data::Message(m));\n"
         "                            }));\n"
         "                        }\n"
@@ -915,7 +915,7 @@ fn wizz_clip_common(s: &flutter::FlutterSession, key: &str, param: &str) -> Stri
                 sid,
                 dest,
                 fallback,
-                Box::new(move |m| {
+                Box::new(move |m: base::message_proto::Message| {
                     crate::client::Interface::send(&*s2, crate::client::Data::Message(m));
                 }),
             );
@@ -938,7 +938,7 @@ fn wizz_clip_common(s: &flutter::FlutterSession, key: &str, param: &str) -> Stri
         }
         "wizz-clip-phone-files" => {
             let paths: Vec<String> = param
-                .split('\n')
+                .split('\\n')
                 .filter(|p| !p.is_empty())
                 .map(|p| p.to_owned())
                 .collect();
