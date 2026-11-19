@@ -68,6 +68,7 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import '../../common/widgets/toolbar.dart';
+import '../../common/shared_state.dart';
 import 'remote_page.dart';
 
 
