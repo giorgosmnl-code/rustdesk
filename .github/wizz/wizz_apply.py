@@ -56,6 +56,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../common.dart';
 import '../../models/model.dart';
+import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'remote_page.dart';
 
@@ -198,6 +199,52 @@ bool wizzReconnectIfDropped(SessionID sessionId) {
   s.dropped.value = false;
   s.ffi.ffiModel.reconnect(s.ffi.dialogManager, s.ffi.sessionId, false);
   return true;
+}
+
+// ---- files from the phone (picker or Android share menu) -> paste on a PC
+List<String> _wizzPendingPhoneFiles = [];
+
+void wizzSendPhoneFiles(List<String> paths) {
+  if (paths.isEmpty) return;
+  _wizzPendingPhoneFiles = paths;
+  wizzFlushPhoneFiles();
+}
+
+/// Hands waiting phone files to the visible PC (they are pasted with Ctrl+V).
+void wizzFlushPhoneFiles() {
+  final m = WizzSessions.to;
+  if (_wizzPendingPhoneFiles.isEmpty || !m.hostMounted || m.sessions.isEmpty) {
+    return;
+  }
+  final s = m.sessions[m.current.value.clamp(0, m.sessions.length - 1)];
+  final sid = s.ffi.sessionId;
+  final n = bind.sessionGetCommonSync(
+          sessionId: sid,
+          key: 'wizz-clip-phone-files',
+          param: _wizzPendingPhoneFiles.join('\n')) ??
+      '0';
+  _wizzPendingPhoneFiles = [];
+  if (n == '0' || n.isEmpty) {
+    showToast('Could not read those files');
+    return;
+  }
+  final code =
+      bind.sessionGetCommonSync(sessionId: sid, key: 'wizz-clip-offer', param: '') ??
+          '0';
+  showToast(code == '1'
+      ? 'Phone files ready: press Ctrl+V on this PC'
+      : 'Phone files ready: paste on a PC with Ctrl+V');
+}
+
+Future<void> wizzPickPhoneFiles() async {
+  final r = await gFFI.invokeMethodWithResult<List<dynamic>>('wizz_pick_files');
+  wizzSendPhoneFiles((r ?? []).map((e) => e.toString()).toList());
+}
+
+/// Files shared to the app from another app (Gallery, Files...).
+Future<void> wizzTakeSharedFiles() async {
+  final r = await gFFI.invokeMethodWithResult<List<dynamic>>('wizz_take_shared');
+  wizzSendPhoneFiles((r ?? []).map((e) => e.toString()).toList());
 }
 
 /// Original mobile behaviour of closeConnection(): back to the home page.
@@ -382,6 +429,15 @@ void showWizzSessionsMenu(BuildContext context) {
               ),
                 ],
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.upload_file),
+              title: const Text('Send files from phone'),
+              subtitle: const Text('Then paste on the PC with Ctrl+V'),
+              onTap: () {
+                Navigator.pop(ctx);
+                wizzPickPhoneFiles();
+              },
             ),
             ListTile(
               leading: const Icon(Icons.add),
@@ -670,7 +726,8 @@ s = rep(s, """    if (state == AppLifecycleState.resumed) {
       trySyncClipboard();""", """    if (state == AppLifecycleState.resumed) {
       if (!widget.active) return;
       sessionRefreshVideo(sessionId, _ffi.ffiModel.pi);
-      trySyncClipboard();""")
+      trySyncClipboard();
+      wizzTakeSharedFiles();""")
 # background PCs get their clipboard switched off, the visible one back on.
 # A local flag remembers which PCs Wizz switched off, so a manual
 # "Disable clipboard" stays as the user set it and a crash is undone next time.
@@ -734,6 +791,7 @@ s = rep(s, """      // copy on one PC, switch, paste on the other
         return;
       }
       () async {
+        await wizzTakeSharedFiles();
         await _wizzBackground(false);
         // fresh picture right away instead of the last 1 fps frame
         sessionRefreshVideo(sessionId, _ffi.ffiModel.pi);
@@ -816,8 +874,66 @@ s = rep(s, "  // Background PCs: clipboard off", r"""  // ---- file copy & paste
       final m = jsonDecode(_wizzClipCall('wizz-clip-status'));
       if (m is Map<String, dynamic> && m.toString() != _wizzClip.toString()) {
         setState(() => _wizzClip = m);
+        _wizzNotify(m);
       }
     } catch (_) {}
+  }
+
+  // download progress in the notification area
+  String _wizzNotifyKey = 'idle';
+
+  void _wizzNotify(Map<String, dynamic> m) {
+    final st = (m['state'] ?? 'idle').toString();
+    final bytes = (m['bytes'] ?? 0) as num;
+    final done = (m['done'] ?? 0) as num;
+    final pct = bytes > 0 ? (done * 100 / bytes).floor().clamp(0, 100) : 0;
+    final names = ((m['names'] ?? []) as List);
+    final count = (m['count'] ?? 0) as int;
+    final what =
+        count == 1 && names.isNotEmpty ? names.first.toString() : '$count items';
+    final saved = ((m['saved'] ?? []) as List);
+    final single = (m['msg'] ?? '') == 'single' && saved.length == 1;
+    final dir = (m['dir'] ?? '').toString().replaceFirst('/storage/emulated/0/', '');
+    String key;
+    Map<String, dynamic> args;
+    switch (st) {
+      case 'downloading':
+        key = 'd$pct';
+        args = {
+          'state': 'downloading',
+          'title': 'Downloading $what',
+          'text': '$pct% · ${_wizzSize(done)} / ${_wizzSize(bytes)}',
+          'progress': pct,
+          'path': '',
+        };
+        break;
+      case 'done':
+        key = 'done${m['seq']}';
+        args = {
+          'state': 'done',
+          'title': 'Downloaded $what',
+          'text': 'Saved to $dir · tap to open',
+          'progress': 100,
+          'path': single ? saved.first.toString() : '',
+        };
+        break;
+      case 'error':
+        key = 'err${m['seq']}';
+        args = {
+          'state': 'error',
+          'title': 'Download failed',
+          'text': (m['msg'] ?? '').toString(),
+          'progress': -1,
+          'path': '',
+        };
+        break;
+      default:
+        key = 'idle';
+        args = {'state': 'clear', 'title': '', 'text': '', 'progress': -1, 'path': ''};
+    }
+    if (key == _wizzNotifyKey) return;
+    _wizzNotifyKey = key;
+    _ffi.invokeMethod("wizz_dl_notify", args);
   }
 
   Future<void> _wizzClipDownload() async {
@@ -904,7 +1020,7 @@ s = rep(s, "  // Background PCs: clipboard off", r"""  // ---- file copy & paste
       left: 8,
       right: 8,
       child: Material(
-        color: Colors.black.withOpacity(0.85),
+        color: Colors.black.withOpacity(0.55),
         borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
@@ -1156,8 +1272,210 @@ class WizzKeepAliveService : Service() {
     }
 }
 """)
+save(kt + 'WizzFiles.kt', """package com.carriez.flutter_hbb
+
+import android.app.Activity
+import android.app.DownloadManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Log
+import android.webkit.MimeTypeMap
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import io.flutter.plugin.common.MethodCall
+import java.io.File
+import java.io.FileOutputStream
+import kotlin.concurrent.thread
+
+// Wizz: files from the phone to paste on a PC, and the download notification.
+object WizzFiles {
+    fun copyToCache(ctx: Context, uris: List<Uri>): List<String> {
+        val dir = File(ctx.cacheDir, "wizz_send")
+        dir.deleteRecursively()
+        dir.mkdirs()
+        val out = mutableListOf<String>()
+        for (u in uris) {
+            try {
+                var name = queryName(ctx, u) ?: u.lastPathSegment ?: "file"
+                name = name.replace('/', '_').replace('\\\\', '_')
+                var f = File(dir, name)
+                var k = 1
+                while (f.exists()) {
+                    f = File(dir, "${k}_$name")
+                    k++
+                }
+                ctx.contentResolver.openInputStream(u)?.use { inp ->
+                    FileOutputStream(f).use { inp.copyTo(it) }
+                }
+                if (f.exists()) out.add(f.absolutePath)
+            } catch (e: Exception) {
+                Log.e("Wizz", "copy: $e")
+            }
+        }
+        return out
+    }
+
+    private fun queryName(ctx: Context, u: Uri): String? = try {
+        ctx.contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+    } catch (e: Exception) {
+        null
+    }
+
+    fun viewIntent(ctx: Context, path: String): Intent {
+        val f = File(path)
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.wizzfiles", f)
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+        return Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    fun notifyDownload(ctx: Context, call: MethodCall) {
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val state = call.argument<String>("state") ?: "clear"
+        if (state == "clear") {
+            nm.cancel(7302)
+            return
+        }
+        val channelId = "wizz_downloads"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "File downloads", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(ctx, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(ctx)
+        }
+        b.setSmallIcon(R.mipmap.ic_stat_logo)
+            .setContentTitle(call.argument<String>("title") ?: "")
+            .setContentText(call.argument<String>("text") ?: "")
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        if (state == "downloading") {
+            val progress = (call.argument<Int>("progress") ?: 0).coerceIn(0, 100)
+            b.setOngoing(true).setOnlyAlertOnce(true).setProgress(100, progress, false)
+            b.setContentIntent(PendingIntent.getActivity(ctx, 7303,
+                Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), flags))
+        } else {
+            b.setAutoCancel(true)
+            val path = call.argument<String>("path") ?: ""
+            val target = try {
+                if (path.isNotEmpty()) viewIntent(ctx, path)
+                else Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            } catch (e: Exception) {
+                Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            b.setContentIntent(PendingIntent.getActivity(ctx, 7302, target, flags))
+        }
+        try {
+            nm.notify(7302, b.build())
+        } catch (e: Exception) {
+            Log.e("Wizz", "notify: $e")
+        }
+    }
+}
+
+// Share menu target: "Paste on PC". Copies the shared files and returns to the app.
+class WizzShareActivity : Activity() {
+    companion object {
+        private val pending = mutableListOf<String>()
+        fun take(): List<String> = synchronized(pending) {
+            val l = pending.toList()
+            pending.clear()
+            l
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val uris = mutableListOf<Uri>()
+        try {
+            @Suppress("DEPRECATION")
+            when (intent?.action) {
+                Intent.ACTION_SEND -> intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.add(it) }
+                Intent.ACTION_SEND_MULTIPLE ->
+                    intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.addAll(it) }
+            }
+            if (uris.isEmpty()) {
+                intent?.clipData?.let { c -> for (k in 0 until c.itemCount) c.getItemAt(k).uri?.let { uris.add(it) } }
+            }
+        } catch (e: Exception) {
+            Log.e("Wizz", "share: $e")
+        }
+        if (uris.isEmpty()) {
+            finish()
+            return
+        }
+        Toast.makeText(this, "Preparing files for the PC…", Toast.LENGTH_SHORT).show()
+        thread {
+            val paths = WizzFiles.copyToCache(applicationContext, uris)
+            synchronized(pending) {
+                pending.clear()
+                pending.addAll(paths)
+            }
+            runOnUiThread {
+                startActivity(Intent(this, MainActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+                finish()
+            }
+        }
+    }
+}
+""")
 p = kt + 'MainActivity.kt'
 s = load(p)
+s = rep(s, "    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {\n        super.onActivityResult(requestCode, resultCode, data)\n",
+        """    private var wizzPickResult: MethodChannel.Result? = null
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 7310) {
+            val r = wizzPickResult ?: return
+            wizzPickResult = null
+            if (resultCode != Activity.RESULT_OK || data == null) {
+                r.success(emptyList<String>())
+                return
+            }
+            val uris = mutableListOf<Uri>()
+            data.data?.let { uris.add(it) }
+            data.clipData?.let { c -> for (k in 0 until c.itemCount) uris.add(c.getItemAt(k).uri) }
+            thread {
+                val paths = WizzFiles.copyToCache(this, uris.distinct())
+                runOnUiThread { r.success(paths) }
+            }
+            return
+        }
+""")
+s = rep(s, '                "try_sync_clipboard" -> {\n', """                "wizz_pick_files" -> {
+                    wizzPickResult = result
+                    val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE)
+                        .setType("*/*")
+                        .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    try {
+                        startActivityForResult(i, 7310)
+                    } catch (e: Exception) {
+                        wizzPickResult = null
+                        result.success(emptyList<String>())
+                    }
+                }
+                "wizz_take_shared" -> result.success(WizzShareActivity.take())
+                "wizz_dl_notify" -> {
+                    WizzFiles.notifyDownload(this, call)
+                    result.success(true)
+                }
+                "try_sync_clipboard" -> {
+""")
 s = rep(s, '                "try_sync_clipboard" -> {\n', """                "wizz_keepalive" -> {
                     try {
                         val n = (call.arguments as? Int) ?: 0
@@ -1218,6 +1536,25 @@ s = rep(s, """        <service
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps remote desktop sessions connected" />
         </service>
+
+        <activity
+            android:name=".WizzShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:label="Paste on PC"
+            android:theme="@style/Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
 
         <provider
             android:name="androidx.core.content.FileProvider"
