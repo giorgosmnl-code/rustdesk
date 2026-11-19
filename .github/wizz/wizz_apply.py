@@ -68,6 +68,8 @@ class WizzSession {
   final bool? isSharedPassword;
   final bool? forceRelay;
   final Key key = UniqueKey();
+  // the connection dropped while this PC was not on screen
+  final RxBool dropped = false.obs;
 
   WizzSession(this.id, this.ffi,
       {this.loginMethod = '',
@@ -175,6 +177,29 @@ class WizzSessions {
   }
 }
 
+/// Error boxes of PCs that are not on screen: mark the PC as dropped instead of
+/// showing the box over the visible PC. Returns true if the box was handled.
+bool wizzOnMsgBox(SessionID sessionId, String type, String title) {
+  final m = WizzSessions.to;
+  if (!m.hostMounted) return false;
+  final i = m.indexOfSessionId(sessionId);
+  if (i < 0) return false;
+  if (!type.contains('error')) return false;
+  m.sessions[i].dropped.value = true;
+  return i != m.current.value;
+}
+
+/// Switching to a PC whose connection dropped: reconnect it. Returns true if so.
+bool wizzReconnectIfDropped(SessionID sessionId) {
+  final m = WizzSessions.to;
+  final i = m.indexOfSessionId(sessionId);
+  if (i < 0 || !m.sessions[i].dropped.value) return false;
+  final s = m.sessions[i];
+  s.dropped.value = false;
+  s.ffi.ffiModel.reconnect(s.ffi.dialogManager, s.ffi.sessionId, false);
+  return true;
+}
+
 /// Original mobile behaviour of closeConnection(): back to the home page.
 void wizzPopToHome() {
   () async {
@@ -237,14 +262,24 @@ class WizzRemoteHost extends StatefulWidget {
 class _WizzRemoteHostState extends State<WizzRemoteHost> {
   final m = WizzSessions.to;
 
+  Worker? _keepAlive;
+
   @override
   void initState() {
     super.initState();
     m.hostMounted = true;
+    // Android keeps the network of an app with a foreground notification, so
+    // the PCs stay connected while another app is open.
+    gFFI.invokeMethod("wizz_keepalive", m.sessions.length);
+    _keepAlive = ever(m.sessions, (List<WizzSession> l) {
+      gFFI.invokeMethod("wizz_keepalive", l.length);
+    });
   }
 
   @override
   void dispose() {
+    _keepAlive?.dispose();
+    gFFI.invokeMethod("wizz_keepalive", 0);
     m.hostMounted = false;
     m.clear();
     super.dispose();
@@ -321,11 +356,16 @@ void showWizzSessionsMenu(BuildContext context) {
                 children: [
             for (var i = 0; i < list.length; i++)
               ListTile(
-                leading: Icon(i == cur
-                    ? Icons.radio_button_checked
-                    : Icons.desktop_windows_outlined),
+                leading: list[i].dropped.value
+                    ? const Icon(Icons.link_off, color: Colors.red)
+                    : Icon(i == cur
+                        ? Icons.radio_button_checked
+                        : Icons.desktop_windows_outlined),
                 title: Text(list[i].title),
-                subtitle: list[i].title != list[i].id ? Text(list[i].id) : null,
+                subtitle: list[i].dropped.value
+                    ? const Text('Disconnected · tap to reconnect',
+                        style: TextStyle(color: Colors.red))
+                    : (list[i].title != list[i].id ? Text(list[i].id) : null),
                 selected: i == cur,
                 onTap: () {
                   Navigator.pop(ctx);
@@ -629,6 +669,7 @@ s = load(p)
 s = rep(s, """    if (state == AppLifecycleState.resumed) {
       trySyncClipboard();""", """    if (state == AppLifecycleState.resumed) {
       if (!widget.active) return;
+      sessionRefreshVideo(sessionId, _ffi.ffiModel.pi);
       trySyncClipboard();""")
 # background PCs get their clipboard switched off, the visible one back on.
 # A local flag remembers which PCs Wizz switched off, so a manual
@@ -689,6 +730,9 @@ s = rep(s, """  @override
   void didUpdateWidget(covariant RemotePage oldWidget) {""")
 s = rep(s, """      // copy on one PC, switch, paste on the other
       _ffi.invokeMethod("wizz_force_sync_clipboard");""", """      // copy on one PC, switch, paste on the other
+      if (wizzReconnectIfDropped(sessionId)) {
+        return;
+      }
       () async {
         await _wizzBackground(false);
         // fresh picture right away instead of the last 1 fps frame
@@ -832,7 +876,25 @@ s = rep(s, "  // Background PCs: clipboard off", r"""  // ---- file copy & paste
             child: const Text('Cancel')));
         break;
       case 'done':
-        text = 'Saved to $dir. Switch to another PC and paste (Ctrl+V).';
+        final saved = ((_wizzClip['saved'] ?? []) as List).cast<dynamic>();
+        final single = msg == 'single' && saved.length == 1;
+        text = 'Saved to $dir';
+        actions.add(TextButton(
+            onPressed: () {
+              if (single) {
+                _ffi.invokeMethod("wizz_open_file", saved.first.toString());
+              } else {
+                _ffi.invokeMethod("wizz_show_downloads");
+              }
+            },
+            child: Text(single ? 'Open' : 'Show')));
+        actions.add(TextButton(
+            onPressed: () {
+              _wizzClipCall('wizz-clip-delete');
+              showToast('Deleted from the phone');
+              _wizzClipPoll();
+            },
+            child: const Text('Delete')));
         break;
       default:
         text = 'Download failed: $msg';
@@ -900,38 +962,30 @@ s = rep(s, "  Future<void> dispose() async {\n", "  Future<void> dispose() async
 s = rep(s, """        if (mounted && widget.active) {
           _ffi.invokeMethod("wizz_force_sync_clipboard");
         }""", """        if (mounted && widget.active) {
-          if (_wizzClipCall('wizz-clip-offer') == '1') {
-            showToast('Files from your phone are ready: paste with Ctrl+V');
-          } else {
+          final code = _wizzClipCall('wizz-clip-offer');
+          if (code == '1') {
+            showToast('Copied files are ready here: paste with Ctrl+V');
+          } else if (code == '0') {
             _ffi.invokeMethod("wizz_force_sync_clipboard");
           }
         }""")
 save(p, s)
 
-# home screen: long-press PCs (any tab, address book included), then Connect
-p = 'flutter/lib/common/widgets/peer_tab_page.dart'
+# home screen: long-press PCs (any tab, address book included), then the arrow
+p = 'flutter/lib/mobile/pages/connection_page.dart'
 s = load(p)
-s = rep(s, "import '../../common.dart';\n",
-        "import '../../common.dart';\nimport '../../mobile/pages/wizz_sessions.dart';\n")
-s = rep(s, """          child: Row(
-            children: [
-              deleteSelection(),""", """          child: Row(
-            children: [
-              if (isMobile) wizzConnectSelection(model),
-              deleteSelection(),""")
-s = rep(s, """  Widget closeSelection() {""", """  Widget wizzConnectSelection(PeerTabModel model) {
-    return _hoverAction(
-        context: context,
-        toolTip: translate('Connect'),
-        onTap: () {
-          final ids = model.selectedPeers.map((e) => e.id).toList();
-          model.setMultiSelectionMode(false);
-          wizzConnectMany(context, ids);
-        },
-        child: Icon(Icons.play_arrow, color: MyTheme.accent));
-  }
-
-  Widget closeSelection() {""")
+s = rep(s, "import 'home_page.dart';\n", "import 'home_page.dart';\nimport 'wizz_sessions.dart';\n")
+s = rep(s, """  void onConnect() {
+    var id = _idController.id;""", """  void onConnect() {
+    // PCs ticked in the list (long-press): connect them all
+    final ptm = gFFI.peerTabModel;
+    if (ptm.multiSelectionMode && ptm.selectedPeers.isNotEmpty) {
+      final ids = ptm.selectedPeers.map((e) => e.id).toList();
+      ptm.setMultiSelectionMode(false);
+      wizzConnectMany(context, ids);
+      return;
+    }
+    var id = _idController.id;""")
 save(p, s)
 
 # ----------------------------------------------------------------- common.dart
@@ -1024,5 +1078,163 @@ save(p, s)
 # ---------------------------------------------------------- new session file
 if WIZZ_SESSIONS_DART is not None:
     save('flutter/lib/mobile/pages/wizz_sessions.dart', WIZZ_SESSIONS_DART)
+
+# ------------------------------------------ dropped PCs: no dialog when hidden
+p = 'flutter/lib/models/model.dart'
+s = load(p)
+s = rep(s, "import 'package:flutter_hbb/utils/scale.dart';\n",
+        "import 'package:flutter_hbb/utils/scale.dart';\nimport '../mobile/pages/wizz_sessions.dart';\n")
+s = rep(s, """  handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    if (parent.target == null) return;
+""", """  handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    if (parent.target == null) return;
+    if (isMobile &&
+        wizzOnMsgBox(sessionId, (evt['type'] ?? '').toString(),
+            (evt['title'] ?? '').toString())) {
+      return;
+    }
+""")
+save(p, s)
+
+# ------------------------------- Android: keep-alive service, open downloads
+kt = 'flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/'
+save(kt + 'WizzKeepAliveService.kt', """package com.carriez.flutter_hbb
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+
+// Wizz: a quiet notification while remote PCs are open, so Android keeps the
+// app's network and the sessions survive switching to another app.
+class WizzKeepAliveService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val n = intent?.getIntExtra("count", 1) ?: 1
+        val channelId = "wizz_sessions"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "Remote sessions", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val open = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        val notification = builder
+            .setSmallIcon(R.mipmap.ic_stat_logo)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(if (n == 1) "Connected to 1 PC" else "Connected to $n PCs")
+            .setContentIntent(open)
+            .setOngoing(true)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(7301, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(7301, notification)
+            }
+        } catch (e: Exception) {
+            stopSelf()
+        }
+        return START_NOT_STICKY
+    }
+}
+""")
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, '                "try_sync_clipboard" -> {\n', """                "wizz_keepalive" -> {
+                    try {
+                        val n = (call.arguments as? Int) ?: 0
+                        val i = Intent(this, WizzKeepAliveService::class.java)
+                        if (n > 0) {
+                            i.putExtra("count", n)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+                        } else {
+                            stopService(i)
+                        }
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "keepalive: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_open_file" -> {
+                    try {
+                        val f = File(call.arguments as String)
+                        val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.wizzfiles", f)
+                        val mime = MimeTypeMap.getSingleton()
+                            .getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+                        val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(Intent.createChooser(i, f.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "open file: $e")
+                        result.success(false)
+                    }
+                }
+                "wizz_show_downloads" -> {
+                    try {
+                        startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                "try_sync_clipboard" -> {
+""")
+save(p, s)
+p = 'flutter/android/app/src/main/AndroidManifest.xml'
+s = load(p)
+s = rep(s, """        <service
+            android:name=".FloatingWindowService"
+            android:enabled="true" />
+""", """        <service
+            android:name=".FloatingWindowService"
+            android:enabled="true" />
+
+        <service
+            android:name=".WizzKeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps remote desktop sessions connected" />
+        </service>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.wizzfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/wizz_file_paths" />
+        </provider>
+""")
+save(p, s)
+save('flutter/android/app/src/main/res/xml/wizz_file_paths.xml', """<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-path name="ext" path="." />
+    <external-files-path name="extfiles" path="." />
+</paths>
+""")
 
 print('wizz multi-session patch applied')
