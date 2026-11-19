@@ -33,7 +33,7 @@ jobs:
       id: k
       shell: bash
       run: |
-        echo "key=wizz-rustlib-aarch64-${{ hashFiles('src/**', 'libs/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', '.github/workflows/bridge.yml', 'flutter/build_android_deps.sh', 'flutter/ndk_arm64.sh') }}" >> "$GITHUB_OUTPUT"
+        echo "key=wizz-rustlib-aarch64-${{ hashFiles('src/**', 'libs/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', '.github/workflows/bridge.yml', 'flutter/build_android_deps.sh', 'flutter/ndk_arm64.sh', '.github/wizz/wizz_rust.py') }}" >> "$GITHUB_OUTPUT"
     - name: Look up cache
       id: c
       uses: actions/cache/restore@v4
@@ -119,6 +119,7 @@ jobs:
         sed -i "s/applicationId \"com.carriez.flutter_hbb\"/applicationId \"$APPID\"/" flutter/android/app/build.gradle
         sed -i "s/android:label=\"RustDesk\"\$/android:label=\"$LABEL\"/" flutter/android/app/src/main/AndroidManifest.xml
         python3 .github/wizz/wizz_apply.py
+        python3 .github/wizz/wizz_rust.py
         grep -n "applicationId \"$APPID\"" flutter/android/app/build.gradle
         grep -n "android:label=\"$LABEL\"" flutter/android/app/src/main/AndroidManifest.xml
         git --no-pager diff --stat
