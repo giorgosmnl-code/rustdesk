@@ -67,6 +67,7 @@ import '../../common.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
+import '../../common/widgets/toolbar.dart';
 import 'remote_page.dart';
 
 
@@ -208,6 +209,99 @@ bool wizzReconnectIfDropped(SessionID sessionId) {
   s.dropped.value = false;
   s.ffi.ffiModel.reconnect(s.ffi.dialogManager, s.ffi.sessionId, false);
   return true;
+}
+
+// ---- privacy mode per PC from the sessions screen
+const _kWizzPrivacyHelp = [
+  'Blacks out the PC monitor. Works on most PCs.',
+  'Uses a virtual display. Needs the RustDesk display driver on the PC.',
+];
+
+Widget wizzPrivacyButton(BuildContext context, WizzSession s) {
+  final state = PrivacyModeState.find(s.id);
+  return Obx(() {
+    final on = state.value.isNotEmpty;
+    final toggles = toolbarPrivacyMode(state, context, s.id, s.ffi);
+    final usable = toggles.any((t) => t.onChanged != null);
+    return GestureDetector(
+      onLongPress: usable && !on
+          ? () => _wizzChoosePrivacy(context, toggles, remember: true)
+          : null,
+      child: IconButton(
+        tooltip: !usable
+            ? 'Privacy mode is not available on this PC'
+            : (on ? 'Privacy on: tap to turn off' : 'Privacy mode'),
+        icon: Icon(on ? Icons.shield : Icons.shield_outlined,
+            color: on
+                ? MyTheme.accent
+                : (usable ? Colors.grey : Colors.grey.withOpacity(0.35))),
+        onPressed: usable ? () => _wizzTogglePrivacy(context, state, toggles) : null,
+      ),
+    );
+  });
+}
+
+void _wizzTogglePrivacy(
+    BuildContext context, RxString state, List<TToggleMenu> toggles) {
+  if (state.value.isNotEmpty) {
+    for (final t in toggles) {
+      if (t.value) {
+        t.onChanged?.call(false);
+        return;
+      }
+    }
+    toggles.first.onChanged?.call(false);
+    return;
+  }
+  if (toggles.length == 1) {
+    toggles.first.onChanged?.call(true);
+    return;
+  }
+  final saved = int.tryParse(bind.mainGetLocalOption(key: 'wizz-privacy-mode'));
+  if (saved != null &&
+      saved >= 0 &&
+      saved < toggles.length &&
+      toggles[saved].onChanged != null) {
+    toggles[saved].onChanged!(true);
+    return;
+  }
+  _wizzChoosePrivacy(context, toggles, remember: true);
+}
+
+/// Mode 1 or Mode 2; the choice is remembered (long-press the shield to change).
+void _wizzChoosePrivacy(BuildContext context, List<TToggleMenu> toggles,
+    {bool remember = true}) {
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Privacy mode'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < toggles.length; i++)
+            ListTile(
+              enabled: toggles[i].onChanged != null,
+              title: toggles[i].child,
+              subtitle: i < _kWizzPrivacyHelp.length
+                  ? Text(_kWizzPrivacyHelp[i])
+                  : null,
+              onTap: () {
+                Navigator.pop(ctx);
+                if (remember) {
+                  bind.mainSetLocalOption(
+                      key: 'wizz-privacy-mode', value: i.toString());
+                }
+                toggles[i].onChanged?.call(true);
+              },
+            ),
+        ],
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+      ],
+    ),
+  );
 }
 
 // ---- files from the phone (picker or Android share menu) -> paste on a PC
@@ -427,13 +521,19 @@ void showWizzSessionsMenu(BuildContext context) {
                   Navigator.pop(ctx);
                   m.switchTo(i);
                 },
-                trailing: IconButton(
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Disconnect',
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    m.closeAt(i);
-                  },
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    wizzPrivacyButton(context, list[i]),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      tooltip: 'Disconnect',
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        m.closeAt(i);
+                      },
+                    ),
+                  ],
                 ),
               ),
                 ],
