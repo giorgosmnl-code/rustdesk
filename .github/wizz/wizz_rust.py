@@ -2,17 +2,18 @@ WIZZ_FILE_CLIP_RS = r'''// Wizz: file copy & paste for the Android client.
 //
 // PC -> phone: a PC announces copied files (FileGroupDescriptorW), we fetch the
 // list and the user can download them into the phone's Download folder.
-// Phone -> PC (and so PC -> PC): the downloaded files become the phone's
-// "clipboard files"; when another PC is shown they are announced to it, and a
-// Ctrl+V / Paste there pulls them from the phone.
+// PC -> PC: when another PC is shown, whatever was copied last (files on a PC,
+// downloaded files, or text) is offered to it. Files copied on a PC are passed
+// straight through: the second PC's read requests are forwarded to the first
+// PC and the answers sent back, nothing is stored on the phone.
 use base::message_proto::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 const DESC_ID: i32 = 49334;
 const DESC_NAME: &str = "FileGroupDescriptorW";
@@ -27,7 +28,6 @@ const FILECONTENTS_RANGE: i32 = 2;
 const RESP_OK: i32 = 1;
 const RESP_FAIL: i32 = 2;
 const EPOCH_DELTA: u64 = 116_444_736_000_000_000;
-const OFFER_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 struct Entry {
@@ -41,8 +41,10 @@ struct Remote {
     desc_id: i32,
     waiting_desc: bool,
     files: Vec<Entry>,
+    pdu: Vec<u8>,
     clip_data_id: i32,
     seq: u64,
+    saved: Vec<String>,
     state: String, // idle | offered | downloading | done | error
     total: u64,
     done: u64,
@@ -59,12 +61,81 @@ struct LocalFile {
 }
 
 struct Local {
-    id: u64,
     src: u64,
     files: Vec<LocalFile>,
     pdu: Vec<u8>,
-    offered: HashSet<u64>,
-    at: Instant,
+}
+
+#[derive(Clone, PartialEq)]
+enum Latest {
+    Nothing,
+    Text,
+    Remote(u64),
+    Local,
+}
+
+#[derive(Clone)]
+enum Source {
+    Remote { src: u64, pdu: Vec<u8>, clip_data_id: i32, sizes: Vec<u64> },
+    Local,
+}
+
+struct Offer {
+    gen: u64,
+    source: Source,
+}
+
+type SendFn = Box<dyn Fn(Message) + Send + 'static>;
+
+fn latest() -> &'static Mutex<(Latest, u64)> {
+    static L: OnceLock<Mutex<(Latest, u64)>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new((Latest::Nothing, 0)))
+}
+
+fn set_latest(v: Latest) {
+    let mut l = latest().lock().unwrap();
+    l.0 = v;
+    l.1 += 1;
+}
+
+fn offers() -> &'static Mutex<HashMap<u64, Offer>> {
+    static O: OnceLock<Mutex<HashMap<u64, Offer>>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn senders() -> &'static Mutex<HashMap<u64, SendFn>> {
+    static S: OnceLock<Mutex<HashMap<u64, SendFn>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// forwarded stream id -> (asking session, its stream id)
+fn relays() -> &'static Mutex<HashMap<i32, (u64, i32)>> {
+    static R: OnceLock<Mutex<HashMap<i32, (u64, i32)>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn send_to(sid: u64, m: Message) -> bool {
+    match senders().lock().unwrap().get(&sid) {
+        Some(f) => {
+            f(m);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Lets messages be sent to session `sid` from other sessions (for pass-through).
+pub fn has_sender(sid: u64) -> bool {
+    senders().lock().unwrap().contains_key(&sid)
+}
+
+pub fn register_sender(sid: u64, f: SendFn) {
+    senders().lock().unwrap().insert(sid, f);
+}
+
+/// Text was copied somewhere (phone or a PC): it becomes the latest copy.
+pub fn note_text() {
+    set_latest(Latest::Text);
 }
 
 fn remotes() -> &'static Mutex<HashMap<u64, Remote>> {
@@ -83,7 +154,6 @@ fn local() -> &'static Mutex<Option<Local>> {
 }
 
 static STREAM_ID: AtomicI32 = AtomicI32::new(0x5a00_0000);
-static LOCAL_ID: AtomicI32 = AtomicI32::new(1);
 
 fn wrap(u: cliprdr::Union) -> Message {
     let mut c = Cliprdr::new();
@@ -221,6 +291,8 @@ pub fn on_msg(sid: u64, clip: Cliprdr) -> Vec<Message> {
                     if r.state == "offered" {
                         r.state = "idle".into();
                     }
+                    drop(rs);
+                    note_text();
                     vec![]
                 }
             }
@@ -243,16 +315,26 @@ pub fn on_msg(sid: u64, clip: Cliprdr) -> Vec<Message> {
                 r.clip_data_id = file_list_id(&pdu);
                 r.total = files.iter().map(|f| f.size).sum();
                 r.files = files;
+                r.pdu = pdu;
                 r.done = 0;
                 r.msg.clear();
                 r.seq += 1;
                 r.state = "offered".into();
+                drop(rs);
+                set_latest(Latest::Remote(sid));
             }
             vec![]
         }
         Some(cliprdr::Union::FileContentsResponse(resp)) => {
             if let Some(tx) = pending().lock().unwrap().remove(&resp.stream_id) {
                 let _ = tx.send((resp.msg_flags == RESP_OK, resp.requested_data.to_vec()));
+                return vec![];
+            }
+            // answer for a pass-through read: back to the PC that asked
+            let relay = relays().lock().unwrap().remove(&resp.stream_id);
+            if let Some((to, stream_id)) = relay {
+                let data = resp.requested_data.to_vec();
+                send_to(to, contents_response(resp.msg_flags == RESP_OK, stream_id, data));
             }
             vec![]
         }
@@ -264,20 +346,66 @@ pub fn on_msg(sid: u64, clip: Cliprdr) -> Vec<Message> {
                     r.files.clear();
                 }
             }
+            drop(rs);
+            let mut l = latest().lock().unwrap();
+            if l.0 == Latest::Remote(sid) {
+                l.0 = Latest::Nothing;
+                l.1 += 1;
+            }
             vec![]
         }
         // The PC pastes files the phone announced to it.
         Some(cliprdr::Union::FormatDataRequest(req)) => {
-            let l = local().lock().unwrap();
-            match l.as_ref() {
-                Some(l) if req.requested_format_id == DESC_ID => {
-                    vec![format_data_response(true, l.pdu.clone())]
-                }
-                _ => vec![format_data_response(false, vec![])],
+            let source = offers().lock().unwrap().get(&sid).map(|o| o.source.clone());
+            if req.requested_format_id != DESC_ID {
+                return vec![format_data_response(false, vec![])];
+            }
+            match source {
+                Some(Source::Remote { pdu, .. }) => vec![format_data_response(true, pdu)],
+                Some(Source::Local) => match local().lock().unwrap().as_ref() {
+                    Some(l) => vec![format_data_response(true, l.pdu.clone())],
+                    None => vec![format_data_response(false, vec![])],
+                },
+                None => vec![format_data_response(false, vec![])],
             }
         }
-        Some(cliprdr::Union::FileContentsRequest(req)) => vec![serve_contents(&req)],
+        Some(cliprdr::Union::FileContentsRequest(req)) => {
+            let source = offers().lock().unwrap().get(&sid).map(|o| o.source.clone());
+            match source {
+                Some(Source::Remote { src, clip_data_id, sizes, .. }) => {
+                    relay_contents(sid, src, clip_data_id, &sizes, req)
+                }
+                _ => vec![serve_contents(&req)],
+            }
+        }
         _ => vec![],
+    }
+}
+
+fn relay_contents(
+    sid: u64,
+    src: u64,
+    clip_data_id: i32,
+    sizes: &[u64],
+    req: CliprdrFileContentsRequest,
+) -> Vec<Message> {
+    if req.dw_flags == FILECONTENTS_SIZE {
+        return match sizes.get(req.list_index as usize) {
+            Some(size) => vec![contents_response(true, req.stream_id, size.to_le_bytes().to_vec())],
+            None => vec![contents_response(false, req.stream_id, vec![])],
+        };
+    }
+    let stream_id = STREAM_ID.fetch_add(1, Ordering::SeqCst);
+    relays().lock().unwrap().insert(stream_id, (sid, req.stream_id));
+    let mut fwd = req.clone();
+    fwd.stream_id = stream_id;
+    fwd.have_clip_data_id = true;
+    fwd.clip_data_id = clip_data_id;
+    if send_to(src, wrap(cliprdr::Union::FileContentsRequest(fwd))) {
+        vec![]
+    } else {
+        relays().lock().unwrap().remove(&stream_id);
+        vec![contents_response(false, req.stream_id, vec![])]
     }
 }
 
@@ -367,17 +495,26 @@ pub fn start_download(
         match download(sid, &root, &files, clip_data_id, &cancel, &send) {
             Ok(saved) => {
                 let pdu = build_pdu(&saved);
-                *local().lock().unwrap() = Some(Local {
-                    id: LOCAL_ID.fetch_add(1, Ordering::SeqCst) as u64,
-                    src: sid,
-                    files: saved,
-                    pdu,
-                    offered: HashSet::new(),
-                    at: Instant::now(),
-                });
+                let tops: Vec<String> = saved
+                    .iter()
+                    .filter(|f| !f.name.contains('/'))
+                    .map(|f| f.path.to_string_lossy().to_string())
+                    .collect();
+                let single = saved.len() == 1 && !saved[0].dir;
+                *local().lock().unwrap() = Some(Local { src: sid, files: saved, pdu });
+                // only take over if nothing newer was copied meanwhile
+                let newer = {
+                    let l = latest().lock().unwrap();
+                    l.0 != Latest::Remote(sid)
+                };
+                if !newer {
+                    set_latest(Latest::Local);
+                }
                 set_state(sid, |r| {
                     r.state = "done".into();
                     r.cancel = None;
+                    r.saved = tops;
+                    r.msg = if single { "single".into() } else { String::new() };
                 });
             }
             Err(e) => set_state(sid, |r| {
@@ -498,14 +635,43 @@ pub fn dismiss(sid: u64) {
     }
 }
 
-/// Announces the phone's files to the PC of session `sid`, once per file set.
-pub fn offer(sid: u64) -> Option<Message> {
-    let mut l = local().lock().unwrap();
-    let l = l.as_mut()?;
-    if l.src == sid || l.offered.contains(&sid) || l.at.elapsed() > OFFER_TTL {
-        return None;
+/// Offers whatever was copied last to the PC of session `sid`.
+/// Returns "1" with a message to send (files offered), "2" (files are the latest
+/// copy but nothing to do for this PC), or "0" (text is the latest copy).
+pub fn offer(sid: u64) -> (&'static str, Option<Message>) {
+    let (l, gen) = latest().lock().unwrap().clone();
+    let source = match l {
+        Latest::Nothing | Latest::Text => return ("0", None),
+        Latest::Remote(src) => {
+            if src == sid {
+                return ("2", None);
+            }
+            let rs = remotes().lock().unwrap();
+            let Some(r) = rs.get(&src) else { return ("0", None) };
+            if r.files.is_empty() || r.pdu.is_empty() {
+                return ("0", None);
+            }
+            Source::Remote {
+                src,
+                pdu: r.pdu.clone(),
+                clip_data_id: r.clip_data_id,
+                sizes: r.files.iter().map(|f| f.size).collect(),
+            }
+        }
+        Latest::Local => {
+            let l = local().lock().unwrap();
+            match l.as_ref() {
+                Some(l) if l.src != sid => Source::Local,
+                Some(_) => return ("2", None),
+                None => return ("0", None),
+            }
+        }
+    };
+    let mut o = offers().lock().unwrap();
+    if o.get(&sid).map(|x| x.gen) == Some(gen) {
+        return ("2", None);
     }
-    l.offered.insert(sid);
+    o.insert(sid, Offer { gen, source });
     let mut list = CliprdrServerFormatList::new();
     for (id, name) in [(DESC_ID, DESC_NAME), (CONTENTS_ID, CONTENTS_NAME)] {
         let mut f = CliprdrFormat::new();
@@ -513,7 +679,39 @@ pub fn offer(sid: u64) -> Option<Message> {
         f.format = name.to_owned();
         list.formats.push(f);
     }
-    Some(wrap(cliprdr::Union::FormatList(list)))
+    ("1", Some(wrap(cliprdr::Union::FormatList(list))))
+}
+
+/// Deletes the files last downloaded from the PC of session `sid`.
+pub fn delete_saved(sid: u64) {
+    let saved = {
+        let mut rs = remotes().lock().unwrap();
+        match rs.get_mut(&sid) {
+            Some(r) => {
+                r.state = "idle".into();
+                std::mem::take(&mut r.saved)
+            }
+            None => vec![],
+        }
+    };
+    for p in &saved {
+        let p = Path::new(p);
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(p);
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    let mut l = local().lock().unwrap();
+    if l.as_ref().map(|x| x.src) == Some(sid) {
+        *l = None;
+        drop(l);
+        let mut lt = latest().lock().unwrap();
+        if lt.0 == Latest::Local {
+            lt.0 = Latest::Nothing;
+            lt.1 += 1;
+        }
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -533,6 +731,16 @@ fn json_escape(s: &str) -> String {
 /// State of session `sid` for the Flutter banner, as JSON.
 pub fn status(sid: u64) -> String {
     let rs = remotes().lock().unwrap();
+    let saved = rs
+        .get(&sid)
+        .map(|r| {
+            r.saved
+                .iter()
+                .map(|p| format!("\"{}\"", json_escape(p)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
     let (state, seq, count, total, done, dir, msg, names) = match rs.get(&sid) {
         Some(r) => {
             let tops: Vec<&Entry> = r.files.iter().filter(|f| !f.name.contains('/')).collect();
@@ -556,7 +764,7 @@ pub fn status(sid: u64) -> String {
     };
     let state = if state.is_empty() { "idle".to_owned() } else { state };
     format!(
-        "{{\"state\":\"{}\",\"seq\":{},\"count\":{},\"bytes\":{},\"done\":{},\"dir\":\"{}\",\"msg\":\"{}\",\"names\":[{}]}}",
+        "{{\"state\":\"{}\",\"seq\":{},\"count\":{},\"bytes\":{},\"done\":{},\"dir\":\"{}\",\"msg\":\"{}\",\"names\":[{}],\"saved\":[{}]}}",
         state,
         seq,
         count,
@@ -564,7 +772,8 @@ pub fn status(sid: u64) -> String {
         done,
         json_escape(&dir),
         json_escape(&msg),
-        names
+        names,
+        saved
     )
 }
 
@@ -572,6 +781,8 @@ pub fn status(sid: u64) -> String {
 pub fn remove_session(sid: u64) {
     cancel(sid);
     remotes().lock().unwrap().remove(&sid);
+    offers().lock().unwrap().remove(&sid);
+    senders().lock().unwrap().remove(&sid);
 }
 '''
 
@@ -607,12 +818,36 @@ s = rep(s, "                Some(message::Union::FileResponse(fr)) => {\n",
         "                Some(message::Union::Cliprdr(clip)) => {\n"
         "                    if self.is_connected {\n"
         "                        let sid = self.handler.lc.read().unwrap().session_id;\n"
+        "                        if !crate::wizz_file_clip::has_sender(sid) {\n"
+        "                            let h = self.handler.clone();\n"
+        "                            crate::wizz_file_clip::register_sender(sid, Box::new(move |m| {\n"
+        "                                Interface::send(&h, Data::Message(m));\n"
+        "                            }));\n"
+        "                        }\n"
         "                        for m in crate::wizz_file_clip::on_msg(sid, clip) {\n"
         "                            allow_err!(peer.send(&m).await);\n"
         "                        }\n"
         "                    }\n"
         "                }\n"
         "                Some(message::Union::FileResponse(fr)) => {\n")
+# text copied on a PC: it becomes the latest copy
+s = rep(s, "                        #[cfg(target_os = \"android\")]\n                        crate::clipboard::handle_msg_clipboard(cb);\n",
+        "                        #[cfg(target_os = \"android\")]\n                        crate::wizz_file_clip::note_text();\n"
+        "                        #[cfg(target_os = \"android\")]\n                        crate::clipboard::handle_msg_clipboard(cb);\n")
+s = rep(s, "                        #[cfg(target_os = \"android\")]\n                        crate::clipboard::handle_msg_multi_clipboards(_mcb);\n",
+        "                        #[cfg(target_os = \"android\")]\n                        crate::wizz_file_clip::note_text();\n"
+        "                        #[cfg(target_os = \"android\")]\n                        crate::clipboard::handle_msg_multi_clipboards(_mcb);\n")
+save(p, s)
+
+# text copied on the phone (sent to the PCs): it becomes the latest copy
+p = 'src/flutter.rs'
+s = load(p)
+s = rep(s, "fn send_clipboard_msg_impl(msg: Message, _is_file: bool, except_session_id: Option<u64>) {\n",
+        "fn send_clipboard_msg_impl(msg: Message, _is_file: bool, except_session_id: Option<u64>) {\n"
+        "    #[cfg(target_os = \"android\")]\n"
+        "    if !_is_file {\n"
+        "        crate::wizz_file_clip::note_text();\n"
+        "    }\n")
 save(p, s)
 
 p = 'src/flutter_ffi.rs'
@@ -652,13 +887,17 @@ fn wizz_clip_common(s: &flutter::FlutterSession, key: &str, param: &str) -> Stri
             crate::wizz_file_clip::dismiss(sid);
             "1".to_owned()
         }
-        "wizz-clip-offer" => match crate::wizz_file_clip::offer(sid) {
-            Some(m) => {
+        "wizz-clip-offer" => {
+            let (code, m) = crate::wizz_file_clip::offer(sid);
+            if let Some(m) = m {
                 crate::client::Interface::send(&**s, crate::client::Data::Message(m));
-                "1".to_owned()
             }
-            None => "0".to_owned(),
-        },
+            code.to_owned()
+        }
+        "wizz-clip-delete" => {
+            crate::wizz_file_clip::delete_saved(sid);
+            "1".to_owned()
+        }
         _ => "".to_owned(),
     }
 }
