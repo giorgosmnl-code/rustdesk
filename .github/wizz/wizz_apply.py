@@ -38,6 +38,15 @@ zrep("""      wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
       }),""")
 open(p, 'w').write(s)
 
+# ===== Wizz: hidden keyboard box padded with invisible blanks, not "1111…" =====
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = open(p).read()
+zrep("final initText = '1' * 1024;", "final initText = '\\u2800' * 1024;")
+zrep("    for (; i >= 0 && newValue[i] != '1'; --i) {}", "    for (; i >= 0 && newValue[i] != initText[0]; --i) {}")
+zrep("    for (; j >= 0 && oldValue[j] != '1'; --j) {}", "    for (; j >= 0 && oldValue[j] != initText[0]; --j) {}")
+zrep("        oldValue[0] == '1' &&\n        newValue[0] != '1') {", "        oldValue[0] == initText[0] &&\n        newValue[0] != initText[0]) {")
+open(p, 'w').write(s)
+
 # ===== Wizz: multi-session =====
 import os, re, sys
 
