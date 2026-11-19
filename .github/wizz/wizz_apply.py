@@ -750,6 +750,164 @@ s = load(p)
 s = rep(s, ".showLoading(translate('Connecting...'), onCancel: closeConnection);",
         ".showLoading(translate('Connecting...'),\n              onCancel: () => closeConnection(sessionId: sessionId));")
 save(p, s)
+# file copy & paste: banner on the visible PC, files offered to the next PC
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, "import 'dart:async';\n",
+        "import 'dart:async';\nimport 'dart:convert';\n\nimport 'package:path_provider/path_provider.dart';\n")
+s = rep(s, "  // Background PCs: clipboard off", r"""  // ---- file copy & paste: copy files on a PC, download them to the phone,
+  // then paste them on another PC with Ctrl+V.
+  Timer? _wizzClipTimer;
+  Map<String, dynamic> _wizzClip = const {};
+  int _wizzClipHiddenSeq = -1;
+  String _wizzClipHiddenState = '';
+
+  String _wizzClipCall(String key, [String param = '']) =>
+      bind.sessionGetCommonSync(sessionId: sessionId, key: key, param: param) ??
+      '';
+
+  void _wizzClipPoll() {
+    if (!mounted || !widget.active) return;
+    try {
+      final m = jsonDecode(_wizzClipCall('wizz-clip-status'));
+      if (m is Map<String, dynamic> && m.toString() != _wizzClip.toString()) {
+        setState(() => _wizzClip = m);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _wizzClipDownload() async {
+    var fallback = '';
+    try {
+      final d = await getExternalStorageDirectory();
+      if (d != null) fallback = '${d.path}/RustDesk';
+    } catch (_) {}
+    _wizzClipCall('wizz-clip-download',
+        '/storage/emulated/0/Download/RustDesk\n$fallback');
+    _wizzClipPoll();
+  }
+
+  String _wizzSize(num b) {
+    if (b < 1024) return '$b B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(0)} KB';
+    if (b < 1024 * 1024 * 1024) {
+      return '${(b / 1024 / 1024).toStringAsFixed(1)} MB';
+    }
+    return '${(b / 1024 / 1024 / 1024).toStringAsFixed(2)} GB';
+  }
+
+  Widget _wizzClipBanner() {
+    final st = (_wizzClip['state'] ?? 'idle').toString();
+    final seq = (_wizzClip['seq'] ?? 0) as int;
+    if (st == 'idle' ||
+        (seq == _wizzClipHiddenSeq && st == _wizzClipHiddenState)) {
+      return const SizedBox.shrink();
+    }
+    final count = (_wizzClip['count'] ?? 0) as int;
+    final bytes = (_wizzClip['bytes'] ?? 0) as num;
+    final done = (_wizzClip['done'] ?? 0) as num;
+    final names = ((_wizzClip['names'] ?? []) as List).cast<dynamic>();
+    final dir = (_wizzClip['dir'] ?? '')
+        .toString()
+        .replaceFirst('/storage/emulated/0/', '');
+    final msg = (_wizzClip['msg'] ?? '').toString();
+    String text;
+    double? progress;
+    final actions = <Widget>[];
+    switch (st) {
+      case 'offered':
+        text = count == 1 && names.isNotEmpty
+            ? 'Copied on PC: ${names.first} (${_wizzSize(bytes)})'
+            : 'Copied on PC: $count items (${_wizzSize(bytes)})';
+        actions.add(TextButton(
+            onPressed: _wizzClipDownload, child: const Text('Download')));
+        break;
+      case 'downloading':
+        final pv = bytes > 0 ? (done / bytes).clamp(0.0, 1.0).toDouble() : 0.0;
+        progress = bytes > 0 ? pv : null;
+        final pct = bytes > 0 ? '${(pv * 100).toStringAsFixed(0)}% · ' : '';
+        text = 'Downloading $pct${_wizzSize(done)} / ${_wizzSize(bytes)}';
+        actions.add(TextButton(
+            onPressed: () => _wizzClipCall('wizz-clip-cancel'),
+            child: const Text('Cancel')));
+        break;
+      case 'done':
+        text = 'Saved to $dir. Switch to another PC and paste (Ctrl+V).';
+        break;
+      default:
+        text = 'Download failed: $msg';
+    }
+    return Positioned(
+      top: 8,
+      left: 8,
+      right: 8,
+      child: Material(
+        color: Colors.black.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(10),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.file_copy, color: Colors.white, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(text,
+                        style: const TextStyle(color: Colors.white),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis),
+                  ),
+                  ...actions,
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () {
+                      if (st != 'downloading') {
+                        _wizzClipCall('wizz-clip-dismiss');
+                      }
+                      setState(() {
+                        _wizzClipHiddenSeq = seq;
+                        _wizzClipHiddenState = st;
+                      });
+                    },
+                  ),
+                ],
+              ),
+              if (st == 'downloading')
+                Padding(
+                  padding: const EdgeInsets.only(right: 8, bottom: 6),
+                  child: LinearProgressIndicator(value: progress),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Background PCs: clipboard off""")
+s = rep(s, """              child: QualityMonitor(_ffi.qualityMonitorModel),
+            ),
+""", """              child: QualityMonitor(_ffi.qualityMonitorModel),
+            ),
+            if (widget.active) _wizzClipBanner(),
+""")
+# poll while shown; stop on close
+s = rep(s, "    _wizzBackground(false);\n    // a PC opened", "    _wizzClipTimer = Timer.periodic(\n        const Duration(seconds: 1), (_) => _wizzClipPoll());\n    _wizzBackground(false);\n    // a PC opened")
+s = rep(s, "  Future<void> dispose() async {\n", "  Future<void> dispose() async {\n    _wizzClipTimer?.cancel();\n")
+# switching to a PC: offer downloaded files there first, else the text clipboard
+s = rep(s, """        if (mounted && widget.active) {
+          _ffi.invokeMethod("wizz_force_sync_clipboard");
+        }""", """        if (mounted && widget.active) {
+          if (_wizzClipCall('wizz-clip-offer') == '1') {
+            showToast('Files from your phone are ready: paste with Ctrl+V');
+          } else {
+            _ffi.invokeMethod("wizz_force_sync_clipboard");
+          }
+        }""")
+save(p, s)
+
 # home screen: long-press PCs (any tab, address book included), then Connect
 p = 'flutter/lib/common/widgets/peer_tab_page.dart'
 s = load(p)
