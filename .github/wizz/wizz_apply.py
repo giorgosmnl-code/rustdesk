@@ -695,14 +695,21 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 
 import '../../common.dart';
+import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
 import '../../models/model.dart';
+import '../../models/state_model.dart';
+import 'home_page.dart';
 import 'wizz_sessions.dart';
 import 'wizz_settings.dart';
 
 class WizzSessionsButton extends StatefulWidget {
-  final void Function() onTap;
-  const WizzSessionsButton({Key? key, required this.onTap}) : super(key: key);
+  final void Function()? onTap;
+  final double padding;
+  final Color? color;
+  const WizzSessionsButton(
+      {Key? key, required this.onTap, this.padding = 12, this.color = Colors.white})
+      : super(key: key);
 
   @override
   State<WizzSessionsButton> createState() => _WizzSessionsButtonState();
@@ -753,8 +760,8 @@ class _WizzSessionsButtonState extends State<WizzSessionsButton> {
         s.hover(null);
       },
       child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: wizzSessionsIcon(),
+        padding: EdgeInsets.all(widget.padding),
+        child: wizzSessionsIcon(color: widget.color),
       ),
     );
   }
@@ -807,6 +814,7 @@ class _WizzStripState extends State<_WizzStrip> {
       if (ctx != null) showWizzConnectDialog(ctx);
     } else {
       m.switchTo(i);
+      wizzReturnToSessions();
     }
   }
 
@@ -879,9 +887,9 @@ class _WizzStripState extends State<_WizzStrip> {
   }
 }
 
-class _WizzPreviewPainter extends CustomPainter {
+class WizzPreviewPainter extends CustomPainter {
   final ImageModel model;
-  _WizzPreviewPainter(this.model) : super(repaint: model);
+  WizzPreviewPainter(this.model) : super(repaint: model);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -895,7 +903,7 @@ class _WizzPreviewPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_WizzPreviewPainter old) => old.model != model;
+  bool shouldRepaint(WizzPreviewPainter old) => old.model != model;
 }
 
 class _WizzCard extends StatelessWidget {
@@ -947,7 +955,7 @@ class _WizzCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(6),
                   child: Stack(fit: StackFit.expand, children: [
                     Container(color: Colors.black),
-                    CustomPaint(painter: _WizzPreviewPainter(s.ffi.imageModel)),
+                    CustomPaint(painter: WizzPreviewPainter(s.ffi.imageModel)),
                     if (dropped)
                       Container(
                         color: Colors.black54,
@@ -1025,6 +1033,292 @@ Widget wizzSwipeSwitch(Widget toolbar) {
     child: toolbar,
   );
 }
+
+// ---------------------------------------------------------------- minimize
+// The PCs keep running in the background while the home screen is shown on
+// top of them; tapping PCs (or a connected PC, or the notification) returns.
+Route<dynamic>? _wizzMiniRoute;
+
+void wizzMinimize() {
+  final m = WizzSessions.to;
+  final nav = globalKey.currentState;
+  if (!m.hostMounted || m.minimized.value || nav == null) return;
+  m.minimized.value = true;
+  stateGlobal.isInMainPage = true;
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+      overlays: SystemUiOverlay.values);
+  final r = MaterialPageRoute(builder: (_) => HomePage(wizzMini: true));
+  _wizzMiniRoute = r;
+  nav.push(r).then((_) {
+    if (identical(_wizzMiniRoute, r)) {
+      _wizzMiniRoute = null;
+      _wizzBackToSessions();
+    }
+  });
+  if (bind.mainGetLocalOption(key: 'wizz-mini-tip') != 'Y') {
+    bind.mainSetLocalOption(key: 'wizz-mini-tip', value: 'Y');
+    showToast('PCs kept in the background. Tap PCs to return');
+  }
+}
+
+void _wizzBackToSessions() {
+  final m = WizzSessions.to;
+  if (!m.minimized.value) return;
+  m.minimized.value = false;
+  stateGlobal.isInMainPage = false;
+  if (m.hostMounted) {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
+  }
+}
+
+/// Back to the open PCs (if the home screen is showing on top of them).
+void wizzReturnToSessions() {
+  final r = _wizzMiniRoute;
+  _wizzMiniRoute = null;
+  if (r != null && r.isActive) {
+    final nav = globalKey.currentState;
+    if (r.isCurrent) {
+      nav?.pop();
+    } else {
+      nav?.removeRoute(r);
+    }
+  }
+  _wizzBackToSessions();
+}
+
+void wizzResetMinimized() {
+  _wizzMiniRoute = null;
+  WizzSessions.to.minimized.value = false;
+}
+
+/// Taps on the keep-alive notification (open / "Disconnect all").
+Future<void> wizzTakeNotificationAction() async {
+  final a =
+      await gFFI.invokeMethodWithResult<String>('wizz_take_action') ?? '';
+  if (a.isEmpty) return;
+  WizzLock.to.afterUnlock(() {
+    if (!WizzSessions.to.hostMounted) return;
+    if (a == 'return') {
+      wizzReturnToSessions();
+    } else if (a == 'closeall') {
+      wizzPopToHome();
+    }
+  });
+}
+
+/// X in the toolbar: with several PCs open, choose this one or all.
+void wizzCloseTapped(BuildContext context, void Function() closeOne) {
+  final m = WizzSessions.to;
+  if (m.sessions.length < 2) {
+    closeOne();
+    return;
+  }
+  final cur = m.current.value.clamp(0, m.sessions.length - 1);
+  final title = m.sessions[cur].title;
+  showModalBottomSheet(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(
+          leading: const Icon(Icons.close),
+          title: Text('Close $title'),
+          onTap: () {
+            Navigator.pop(ctx);
+            m.closeAt(m.current.value);
+          },
+        ),
+        ListTile(
+          leading: const Icon(Icons.clear_all, color: Colors.redAccent),
+          title: Text('Close all ${m.sessions.length} PCs',
+              style: const TextStyle(color: Colors.redAccent)),
+          onTap: () {
+            Navigator.pop(ctx);
+            wizzPopToHome();
+          },
+        ),
+      ]),
+    ),
+  );
+}
+
+// ------------------------------------------------------- session toolbar
+Widget wizzTb(String id, Widget w) =>
+    KeyedSubtree(key: ValueKey<String>('wztb-$id'), child: w);
+
+String? _wizzTbId(Widget w) {
+  final k = w.key;
+  if (k is ValueKey<String> && k.value.startsWith('wztb-')) {
+    return k.value.substring(5);
+  }
+  return null;
+}
+
+/// Orders the toolbar buttons as set in Settings; hidden ones go under ⋮.
+List<Widget> wizzArrange(
+    BuildContext context, void Function() onMore, List<Widget> all) {
+  final byId = <String, Widget>{};
+  final other = <Widget>[];
+  for (final w in all) {
+    final id = _wizzTbId(w);
+    if (id == null) {
+      other.add(w);
+    } else {
+      byId[id] = w;
+    }
+  }
+  byId.remove('more');
+  final hiddenIds = WizzPrefs.tbHidden;
+  final visible = <Widget>[];
+  final hidden = <MapEntry<String, Widget>>[];
+  for (final id in WizzPrefs.tbOrder) {
+    final w = byId.remove(id);
+    if (w == null) continue;
+    if (hiddenIds.contains(id)) {
+      hidden.add(MapEntry(id, w));
+    } else {
+      visible.add(w);
+    }
+  }
+  visible.addAll(byId.values);
+  visible.addAll(other);
+  visible.add(IconButton(
+    color: Colors.white,
+    icon: const Icon(Icons.more_vert),
+    onPressed: () {
+      if (hidden.isEmpty && WizzSessions.to.sessions.length < 2) {
+        onMore();
+      } else {
+        _wizzMoreSheet(context, hidden, onMore);
+      }
+    },
+  ));
+  return visible;
+}
+
+void _wizzMoreSheet(BuildContext context, List<MapEntry<String, Widget>> hidden,
+    void Function() onMore) {
+  const white = TextStyle(color: Colors.white);
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: wizzToolbarColor(opaque: true),
+    builder: (ctx) {
+      final route = ModalRoute.of(ctx);
+      void closeSheet() {
+        Future.microtask(() {
+          if (route != null && route.isActive) {
+            Navigator.of(ctx).removeRoute(route);
+          }
+        });
+      }
+
+      return SafeArea(
+        child: IconTheme.merge(
+          data: const IconThemeData(color: Colors.white),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            if (hidden.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 12, 8, 4),
+                child: Wrap(spacing: 12, runSpacing: 8, children: [
+                  for (final e in hidden)
+                    Listener(
+                      onPointerUp: (_) => closeSheet(),
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        e.value,
+                        Text(kWizzTbLabels[e.key] ?? e.key,
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 11)),
+                      ]),
+                    ),
+                ]),
+              ),
+            if (WizzSessions.to.sessions.length > 1)
+              ListTile(
+                leading: const Icon(Icons.clear_all),
+                title: Text('Disconnect all ${WizzSessions.to.sessions.length} PCs',
+                    style: white),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  wizzPopToHome();
+                },
+              ),
+            ListTile(
+              leading: const Icon(Icons.more_horiz),
+              title: const Text('More options', style: white),
+              onTap: () {
+                Navigator.pop(ctx);
+                onMore();
+              },
+            ),
+          ]),
+        ),
+      );
+    },
+  );
+}
+
+// ------------------------------------------------- home: PCs tab, previews
+class WizzPcsTab extends StatelessWidget implements PageShape {
+  WizzPcsTab({Key? key}) : super(key: key);
+
+  @override
+  final String title = 'PCs';
+
+  @override
+  final Widget icon = const WizzSessionsButton(onTap: null, padding: 0, color: null);
+
+  @override
+  final List<Widget> appBarActions = const [];
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
+}
+
+/// The platform square in the PC list: a live picture when that PC is open.
+Widget wizzPeerTile(String id, double size, Widget fallback) {
+  if (!isAndroid) return fallback;
+  return Obx(() {
+    final m = WizzSessions.to;
+    final i = m.sessions.indexWhere((s) => s.id == id);
+    if (i < 0) return fallback;
+    final s = m.sessions[i];
+    final dropped = s.dropped.value;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+            color: dropped ? Colors.red : Colors.greenAccent, width: 2),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Stack(fit: StackFit.expand, children: [
+          CustomPaint(painter: WizzPreviewPainter(s.ffi.imageModel)),
+          if (dropped)
+            Container(
+              color: Colors.black54,
+              alignment: Alignment.center,
+              child: const Icon(Icons.link_off, color: Colors.red, size: 18),
+            )
+          else
+            Positioned(
+              right: 2,
+              bottom: 2,
+              child: Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                    color: Colors.greenAccent,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.black, width: 1)),
+              ),
+            ),
+        ]),
+      ),
+    );
+  });
+}
 '''
 
 WIZZ_SETTINGS_DART = r'''// Wizz: Multiview settings (app lock, favourite keys, file copy & paste),
@@ -1035,6 +1329,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:settings_ui/settings_ui.dart';
 
@@ -1073,6 +1368,35 @@ class WizzPrefs {
   static int get autoDeleteHours => _int('auto-delete', 0);
   static set autoDeleteHours(int v) => _set('auto-delete', '$v');
 
+  // session toolbar
+  static List<String> get tbOrder {
+    final saved = _get('tb-order', '').split(',')
+      ..removeWhere((e) => !kWizzTbLabels.containsKey(e));
+    for (final id in kWizzTbDefault) {
+      if (!saved.contains(id)) saved.add(id);
+    }
+    return saved;
+  }
+
+  static set tbOrder(List<String> v) => _set('tb-order', v.join(','));
+  static List<String> get tbHidden =>
+      _get('tb-hidden', '').split(',')..removeWhere((e) => e.isEmpty);
+  static set tbHidden(List<String> v) => _set('tb-hidden', v.join(','));
+  static String get tbColor => _get('tb-color', 'blue');
+  static set tbColor(String v) => _set('tb-color', v);
+  static bool get tbFloat => _get('tb-float', 'N') == 'Y';
+  static set tbFloat(bool v) => _set('tb-float', v ? 'Y' : 'N');
+  static int get tbSeeThrough => _int('tb-see', 40);
+  static set tbSeeThrough(int v) => _set('tb-see', '$v');
+
+  // home screen tabs
+  static bool get homePcs => _get('home-pcs', 'Y') == 'Y';
+  static set homePcs(bool v) => _set('home-pcs', v ? 'Y' : 'N');
+  static bool get homeChat => _get('home-chat', 'Y') == 'Y';
+  static set homeChat(bool v) => _set('home-chat', v ? 'Y' : 'N');
+  static bool get homeShare => _get('home-share', 'Y') == 'Y';
+  static set homeShare(bool v) => _set('home-share', v ? 'Y' : 'N');
+
   // switching PCs
   static bool get swipeSwitch => _get('swipe-switch', 'N') == 'Y';
   static set swipeSwitch(bool v) => _set('swipe-switch', v ? 'Y' : 'N');
@@ -1106,6 +1430,49 @@ const List<Shadow> kWizzTextOutline = [
 
 Color wizzBarColor(int seeThroughPercent) =>
     Colors.black.withOpacity((100 - seeThroughPercent.clamp(0, 100)) / 100.0);
+
+// -------------------------------------------------------- session toolbar
+const Map<String, String> kWizzTbLabels = {
+  'close': 'Disconnect',
+  'display': 'Display',
+  'pcs': 'PCs',
+  'minimize': 'Minimize',
+  'keyboard': 'Keyboard',
+  'touch': 'Mouse / touch',
+  'chat': 'Chat',
+};
+const List<String> kWizzTbDefault = [
+  'close', 'display', 'pcs', 'minimize', 'keyboard', 'touch', 'chat'
+];
+const Map<String, IconData> kWizzTbIcons = {
+  'close': Icons.clear,
+  'display': Icons.tv,
+  'pcs': Icons.filter_none,
+  'minimize': Icons.minimize,
+  'keyboard': Icons.keyboard,
+  'touch': Icons.mouse,
+  'chat': Icons.message,
+};
+
+final Map<String, Color> kWizzTbColors = {
+  'blue': MyTheme.accent,
+  'black': Colors.black,
+  'grey': const Color(0xFF2E2E2E),
+  'purple': const Color(0xFF6A1B9A),
+  'green': const Color(0xFF2E7D32),
+  'teal': const Color(0xFF00796B),
+  'red': const Color(0xFFC62828),
+  'orange': const Color(0xFFEF6C00),
+};
+
+Color wizzToolbarColor({bool opaque = false}) {
+  final c = kWizzTbColors[WizzPrefs.tbColor] ?? MyTheme.accent;
+  if (opaque || !WizzPrefs.tbFloat) return c;
+  return c.withOpacity((100 - WizzPrefs.tbSeeThrough.clamp(0, 100)) / 100.0);
+}
+
+/// Bumped when the home tabs change, so open home screens rebuild.
+final RxInt wizzHomeRev = 0.obs;
 
 // ------------------------------------------------------- favourite keys
 class WizzKey {
@@ -1304,6 +1671,18 @@ class WizzLock with WidgetsBindingObserver {
   bool _started = false;
   bool _locked = false;
   DateTime? _away;
+  final List<void Function()> _afterUnlock = [];
+
+  bool get isLocked => _locked;
+
+  /// Runs now, or once the app is unlocked.
+  void afterUnlock(void Function() f) {
+    if (_locked) {
+      _afterUnlock.add(f);
+    } else {
+      f();
+    }
+  }
 
   void start() {
     if (_started) return;
@@ -1337,7 +1716,14 @@ class WizzLock with WidgetsBindingObserver {
     nav
         .push(MaterialPageRoute(
             fullscreenDialog: true, builder: (_) => const WizzLockPage()))
-        .then((_) => _locked = false);
+        .then((_) {
+      _locked = false;
+      final l = List.of(_afterUnlock);
+      _afterUnlock.clear();
+      for (final f in l) {
+        f();
+      }
+    });
   }
 }
 
@@ -1503,6 +1889,18 @@ SettingsSection wizzSettingsSection(BuildContext context, void Function() refres
       value: const Text('Favourites and transparency'),
       leading: const Icon(Icons.keyboard_outlined),
       onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzKeysSettingsPage())),
+    ),
+    SettingsTile(
+      title: const Text('Session toolbar'),
+      value: const Text('Buttons, colour, transparency'),
+      leading: const Icon(Icons.view_week_outlined),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzToolbarSettingsPage())),
+    ),
+    SettingsTile(
+      title: const Text('Home screen tabs'),
+      value: const Text('PCs, Chat, Share screen'),
+      leading: const Icon(Icons.tab_outlined),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzHomeTabsSettingsPage())),
     ),
     SettingsTile(
       title: const Text('File copy & paste'),
@@ -1757,6 +2155,179 @@ class _WizzFilesSettingsPageState extends State<WizzFilesSettingsPage> {
           padding: EdgeInsets.all(16),
           child: Text('Only files downloaded by this app are deleted.'),
         ),
+      ]),
+    );
+  }
+}
+
+class WizzToolbarSettingsPage extends StatefulWidget {
+  const WizzToolbarSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzToolbarSettingsPage> createState() => _WizzToolbarSettingsPageState();
+}
+
+class _WizzToolbarSettingsPageState extends State<WizzToolbarSettingsPage> {
+  late List<String> _order = WizzPrefs.tbOrder;
+  late List<String> _hidden = WizzPrefs.tbHidden;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Session toolbar')),
+      body: ListView(children: [
+        // preview of the bar
+        Container(
+          margin: const EdgeInsets.all(16),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+          decoration: BoxDecoration(
+            gradient: WizzPrefs.tbFloat
+                ? const LinearGradient(colors: [Colors.white, Colors.lightBlueAccent, Colors.amber])
+                : null,
+            color: WizzPrefs.tbFloat ? null : Colors.black,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            color: wizzToolbarColor(),
+            child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              for (final id in _order)
+                if (!_hidden.contains(id))
+                  Icon(kWizzTbIcons[id], color: Colors.white, shadows: kWizzTextOutline),
+              const Icon(Icons.more_vert, color: Colors.white, shadows: kWizzTextOutline),
+            ]),
+          ),
+        ),
+        const ListTile(
+          title: Text('Buttons', style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: Text('Untick to move a button under ⋮. Drag to reorder.'),
+        ),
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          onReorder: (a, b) => setState(() {
+            if (b > a) b--;
+            _order.insert(b, _order.removeAt(a));
+            WizzPrefs.tbOrder = _order;
+          }),
+          children: [
+            for (final id in _order)
+              CheckboxListTile(
+                key: ValueKey(id),
+                value: !_hidden.contains(id),
+                title: Text(kWizzTbLabels[id] ?? id),
+                secondary: Icon(kWizzTbIcons[id]),
+                onChanged: (v) => setState(() {
+                  if (v == true) {
+                    _hidden.remove(id);
+                  } else {
+                    _hidden.add(id);
+                  }
+                  WizzPrefs.tbHidden = _hidden;
+                }),
+              ),
+          ],
+        ),
+        const Divider(),
+        const ListTile(title: Text('Colour'), dense: true),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Wrap(spacing: 12, runSpacing: 12, children: [
+            for (final e in kWizzTbColors.entries)
+              GestureDetector(
+                onTap: () => setState(() => WizzPrefs.tbColor = e.key),
+                child: Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: e.value,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                        color: WizzPrefs.tbColor == e.key ? Colors.white : Colors.white24,
+                        width: WizzPrefs.tbColor == e.key ? 3 : 1),
+                  ),
+                  child: WizzPrefs.tbColor == e.key
+                      ? const Icon(Icons.check, color: Colors.white, shadows: kWizzTextOutline)
+                      : null,
+                ),
+              ),
+          ]),
+        ),
+        const SizedBox(height: 8),
+        SwitchListTile(
+          title: const Text('Float over the screen'),
+          subtitle: const Text('The PC picture uses the full height; the bar sits on top'),
+          value: WizzPrefs.tbFloat,
+          onChanged: (v) => setState(() => WizzPrefs.tbFloat = v),
+        ),
+        if (WizzPrefs.tbFloat)
+          _WizzSlider('Toolbar', WizzPrefs.tbSeeThrough,
+              (v) => setState(() => WizzPrefs.tbSeeThrough = v), '✕   🖵   ⧉   ⌨   ⋮'),
+        TextButton(
+            onPressed: () => setState(() {
+                  _order = List.of(kWizzTbDefault);
+                  _hidden = [];
+                  WizzPrefs.tbOrder = _order;
+                  WizzPrefs.tbHidden = _hidden;
+                  WizzPrefs.tbColor = 'blue';
+                  WizzPrefs.tbFloat = false;
+                }),
+            child: const Text('Reset to default')),
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('Changes show the next time the toolbar is drawn (tap the screen or switch PC).'),
+        ),
+      ]),
+    );
+  }
+}
+
+class WizzHomeTabsSettingsPage extends StatefulWidget {
+  const WizzHomeTabsSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzHomeTabsSettingsPage> createState() => _WizzHomeTabsSettingsPageState();
+}
+
+class _WizzHomeTabsSettingsPageState extends State<WizzHomeTabsSettingsPage> {
+  void _changed() {
+    setState(() {});
+    wizzHomeRev.value++;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Home screen tabs')),
+      body: ListView(children: [
+        const SwitchListTile(
+            title: Text('Connection'), value: true, onChanged: null),
+        SwitchListTile(
+          title: const Text('PCs'),
+          subtitle: const Text('Shown while PCs are open: tap to go back, hold for previews'),
+          value: WizzPrefs.homePcs,
+          onChanged: (v) {
+            WizzPrefs.homePcs = v;
+            _changed();
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Chat'),
+          value: WizzPrefs.homeChat,
+          onChanged: (v) {
+            WizzPrefs.homeChat = v;
+            _changed();
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Share screen'),
+          subtitle: const Text('Hiding the tab does not change any security setting'),
+          value: WizzPrefs.homeShare,
+          onChanged: (v) {
+            WizzPrefs.homeShare = v;
+            _changed();
+          },
+        ),
+        const SwitchListTile(
+            title: Text('Settings'), value: true, onChanged: null),
       ]),
     );
   }
@@ -3313,6 +3884,309 @@ s = rep(s, """                    IconButton(
                     }),
 """)
 s = rep(s, "? getBottomAppBar()", "? wizzSwipeSwitch(getBottomAppBar())")
+save(p, s)
+
+# ===== Wizz: minimize, PCs tab, live previews in the list, X menu, custom toolbar & home tabs =====
+p = 'flutter/lib/mobile/pages/wizz_sessions.dart'
+s = load(p)
+s = rep(s, "  final RxInt current = 0.obs;\n", "  final RxInt current = 0.obs;\n  // the home screen is showing on top of the open PCs\n  final RxBool minimized = false.obs;\n")
+s = rep(s, "  return i != m.current.value;\n}", "  return i != m.current.value || m.minimized.value;\n}")
+s = rep(s, """Widget wizzSessionsIcon() {
+  return Obx(() {
+    final n = WizzSessions.to.sessions.length;
+    final icon = Icon(Icons.filter_none, color: Colors.white);
+    if (n <= 1) return icon;
+    return Badge(label: Text('$n'), child: icon);
+  });
+}""", """Widget wizzSessionsIcon({Color? color = Colors.white}) {
+  return Obx(() {
+    final list = WizzSessions.to.sessions;
+    final n = list.length;
+    final dropped = list.any((s) => s.dropped.value);
+    final icon = Icon(Icons.filter_none, color: color);
+    if (n <= 1 && !dropped) return icon;
+    return Badge(
+        label: Text(dropped ? '!' : '$n'),
+        backgroundColor: dropped ? Colors.red : const Color(0xFF424242),
+        child: icon);
+  });
+}""")
+s = rep(s, """    m.add(id,
+        loginMethod: loginMethod,
+        password: password,
+        isSharedPassword: isSharedPassword,
+        forceRelay: forceRelay);
+    return;
+  }""", """    m.add(id,
+        loginMethod: loginMethod,
+        password: password,
+        isSharedPassword: isSharedPassword,
+        forceRelay: forceRelay);
+    wizzReturnToSessions();
+    return;
+  }""")
+s = rep(s, "class _WizzRemoteHostState extends State<WizzRemoteHost> {", "class _WizzRemoteHostState extends State<WizzRemoteHost>\n    with WidgetsBindingObserver {")
+s = rep(s, "    m.hostMounted = true;\n    // Android keeps", "    m.hostMounted = true;\n    WidgetsBinding.instance.addObserver(this);\n    // Android keeps")
+s = rep(s, "  void dispose() {\n    _keepAlive?.dispose();\n", """  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) wizzTakeNotificationAction();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    wizzResetMinimized();
+    _keepAlive?.dispose();
+""")
+s = rep(s, "    return Obx(() {\n      final list = m.sessions.toList();\n      final cur = m.current.value.clamp(0, list.isEmpty ? 0 : list.length - 1);\n",
+        "    return Obx(() {\n      final list = m.sessions.toList();\n      final cur = m.current.value.clamp(0, list.isEmpty ? 0 : list.length - 1);\n      final mini = m.minimized.value;\n")
+s = rep(s, "                active: i == cur,\n", "                active: i == cur && !mini,\n")
+s = rep(s, "import 'remote_page.dart';\n", "import 'remote_page.dart';\nimport 'wizz_switcher.dart';\n")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+# back = keep the PCs in the background
+s = rep(s, """          ? () async {
+              clientClose(sessionId, _ffi);
+              return false;
+            }""", """          ? () async {
+              if (WizzSessions.to.hostMounted) {
+                wizzMinimize();
+              } else {
+                clientClose(sessionId, _ffi);
+              }
+              return false;
+            }""")
+# float over the screen
+s = rep(s, "      child: Scaffold(\n          // workaround for https://github.com/rustdesk/rustdesk/issues/3131\n",
+        "      child: Scaffold(\n          extendBody: WizzPrefs.tbFloat,\n          // workaround for https://github.com/rustdesk/rustdesk/issues/3131\n")
+s = rep(s, "                        : SafeArea(\n                            child:\n                                OrientationBuilder(",
+        "                        : SafeArea(\n                            bottom: !WizzPrefs.tbFloat,\n                            child:\n                                OrientationBuilder(")
+s = rep(s, "    return BottomAppBar(\n      elevation: 10,\n      color: MyTheme.accent,\n      child: Row(",
+        "    return BottomAppBar(\n      elevation: WizzPrefs.tbFloat ? 0 : 10,\n      color: wizzToolbarColor(),\n      child: IconTheme.merge(\n      data: const IconThemeData(shadows: kWizzTextOutline),\n      child: Row(")
+s = rep(s, "              )),\n        ],\n      ),\n    );\n  }\n\n  bool get showCursorPaint",
+        "              )),\n        ],\n      )),\n    );\n  }\n\n  bool get showCursorPaint")
+# buttons with ids
+s = rep(s, """              child: Row(
+              children: <Widget>[
+                    IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.clear),
+                      onPressed: () {
+                        clientClose(sessionId, _ffi);
+                      },
+                    ),
+                    IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.tv),
+                      onPressed: () {
+                        setState(() => _showEdit = false);
+                        showOptions(context, widget.id, _ffi.dialogManager,
+                            ffiOverride: _ffi);
+                      },
+                    ),
+                    WizzSessionsButton(onTap: () {
+                      setState(() => _showEdit = false);
+                      showWizzSessionsMenu(context);
+                    }),
+""", """              child: Row(
+              children: wizzArrange(context, () {
+                        setState(() => _showEdit = false);
+                        showActions(widget.id);
+                      }, <Widget>[
+                    wizzTb('close', IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.clear),
+                      onPressed: () => wizzCloseTapped(
+                          context, () => clientClose(sessionId, _ffi)),
+                    )),
+                    wizzTb('display', IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.tv),
+                      onPressed: () {
+                        setState(() => _showEdit = false);
+                        showOptions(context, widget.id, _ffi.dialogManager,
+                            ffiOverride: _ffi);
+                      },
+                    )),
+                    wizzTb('pcs', WizzSessionsButton(onTap: () {
+                      setState(() => _showEdit = false);
+                      showWizzSessionsMenu(context);
+                    })),
+                    wizzTb('minimize', IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.minimize),
+                      onPressed: wizzMinimize,
+                    )),
+""")
+s = rep(s, """                              IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(Icons.keyboard),
+                                  onPressed: openKeyboard),""", """                              wizzTb('keyboard', IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(Icons.keyboard),
+                                  onPressed: openKeyboard)),""", count=2)
+s = rep(s, """                              IconButton(
+                                color: Colors.white,
+                                icon: const Icon(Icons.build),
+                                onPressed: () => _ffi.dialogManager
+                                    .toggleMobileActionsOverlay(ffi: _ffi),
+                              )""", """                              wizzTb('touch', IconButton(
+                                color: Colors.white,
+                                icon: const Icon(Icons.build),
+                                onPressed: () => _ffi.dialogManager
+                                    .toggleMobileActionsOverlay(ffi: _ffi),
+                              ))""")
+s = rep(s, """                              IconButton(
+                                color: Colors.white,
+                                icon: Icon(_ffi.ffiModel.touchMode
+                                    ? Icons.touch_app
+                                    : Icons.mouse),
+                                onPressed: () => setState(
+                                    () => _showGestureHelp = !_showGestureHelp),
+                              ),""", """                              wizzTb('touch', IconButton(
+                                color: Colors.white,
+                                icon: Icon(_ffi.ffiModel.touchMode
+                                    ? Icons.touch_app
+                                    : Icons.mouse),
+                                onPressed: () => setState(
+                                    () => _showGestureHelp = !_showGestureHelp),
+                              )),""")
+s = rep(s, """                          futureBuilder(
+                              future: _ffi.invokeMethod(
+                                  "get_value", "KEY_IS_SUPPORT_VOICE_CALL"),""", """                          wizzTb('chat', futureBuilder(
+                              future: _ffi.invokeMethod(
+                                  "get_value", "KEY_IS_SUPPORT_VOICE_CALL"),""")
+s = rep(s, """                                  ))
+                        ]) +""", """                                  )))
+                        ]) +""")
+s = rep(s, """                    IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.more_vert),
+                      onPressed: () {
+                        setState(() => _showEdit = false);
+                        showActions(widget.id);
+                      },
+                    ),
+                  ]),""", """                    wizzTb('more', IconButton(
+                      color: Colors.white,
+                      icon: Icon(Icons.more_vert),
+                      onPressed: () {
+                        setState(() => _showEdit = false);
+                        showActions(widget.id);
+                      },
+                    )),
+                  ])),""")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/home_page.dart'
+s = load(p)
+s = rep(s, "import 'wizz_settings.dart';\n", "import 'wizz_settings.dart';\nimport 'wizz_switcher.dart';\n")
+s = rep(s, "  HomePage() : super(key: homeKey);\n",
+        "  /// A second home screen shown on top of the open PCs (minimized).\n  final bool wizzMini;\n\n  HomePage({this.wizzMini = false}) : super(key: wizzMini ? null : homeKey);\n")
+s = rep(s, """  void refreshPages() {
+    setState(() {
+      initPages();
+    });
+  }
+""", """  void refreshPages() {
+    final wasSettings = _selectedIndex < _pages.length &&
+        _pages[_selectedIndex] is SettingsPage;
+    setState(() {
+      initPages();
+      if (wasSettings || _selectedIndex >= _pages.length) {
+        _selectedIndex = _pages.length - 1;
+      }
+    });
+  }
+
+  Worker? _wizzRev;
+
+  @override
+  void dispose() {
+    _wizzRev?.dispose();
+    super.dispose();
+  }
+""")
+s = rep(s, "    initPages();\n    WizzLock.to.start();\n",
+        "    initPages();\n    WizzLock.to.start();\n    _wizzRev = ever(wizzHomeRev, (_) {\n      if (mounted) refreshPages();\n    });\n")
+s = rep(s, "    _pages.clear();\n", "    _pages.clear();\n    _chatPageTabIndex = -1;\n")
+s = rep(s, """    if (isAndroid && !bind.isOutgoingOnly()) {
+      _chatPageTabIndex = _pages.length;
+      _pages.addAll([ChatPage(type: ChatPageType.mobileMain), ServerPage()]);
+    }""", """    if (widget.wizzMini && WizzPrefs.homePcs) {
+      _pages.add(WizzPcsTab());
+    }
+    if (isAndroid && !bind.isOutgoingOnly()) {
+      if (WizzPrefs.homeChat) {
+        _chatPageTabIndex = _pages.length;
+        _pages.add(ChatPage(type: ChatPageType.mobileMain));
+      }
+      if (WizzPrefs.homeShare) _pages.add(ServerPage());
+    }""")
+s = rep(s, "            key: navigationBarKey,\n", "            key: widget.wizzMini ? null : navigationBarKey,\n")
+s = rep(s, "            onTap: (index) => setState(() {\n", "            onTap: (index) {\n              if (_pages[index] is WizzPcsTab) {\n                wizzReturnToSessions();\n                return;\n              }\n              setState(() {\n")
+s = rep(s, """                }
+              }
+            }),
+          ),
+          body: _pages.elementAt(_selectedIndex),""", """                }
+              }
+            });
+            },
+          ),
+          body: _pages.elementAt(_selectedIndex),""")
+save(p, s)
+
+p = 'flutter/lib/common/widgets/peer_card.dart'
+s = load(p)
+s = rep(s, "import '../../common.dart';\n", "import '../../common.dart';\nimport '../../mobile/pages/wizz_switcher.dart';\n")
+s = rep(s, """                getPlatformImage(peer.platform, size: isPortrait ? 38 : 30)
+                    .paddingAll(6),""", """                wizzPeerTile(
+                    peer.id,
+                    isPortrait ? 50 : 42,
+                    getPlatformImage(peer.platform, size: isPortrait ? 38 : 30)
+                        .paddingAll(6)),""")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/settings_page.dart'
+s = load(p)
+s = rep(s, '                  title: Text(translate("Fingerprint")),', "                  title: Text('Device key fingerprint'),")
+save(p, s)
+
+# notification: tap returns to the PCs, "Disconnect all" button
+p = kt + 'WizzKeepAliveService.kt'
+s = load(p)
+s = rep(s, "Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),",
+        "Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)\n                .putExtra(\"wizz_action\", \"return\"),")
+s = rep(s, "        val builder = if", """        val closeAll = PendingIntent.getActivity(
+            this, 1,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra("wizz_action", "closeall"),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val builder = if""")
+s = rep(s, "        val notification = builder\n", "        @Suppress(\"DEPRECATION\")\n        val notification = builder\n")
+s = rep(s, "            .setContentIntent(open)\n", "            .setContentIntent(open)\n            .addAction(0, \"Disconnect all\", closeAll)\n")
+save(p, s)
+
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, "    private var wizzTreeResult: MethodChannel.Result? = null\n", """    private var wizzTreeResult: MethodChannel.Result? = null
+    private var wizzAction = ""
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.getStringExtra("wizz_action")?.let { wizzAction = it }
+    }
+""")
+s = rep(s, "    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n",
+        "    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n        intent?.getStringExtra(\"wizz_action\")?.let { wizzAction = it }\n")
+s = rep(s, '                "wizz_take_shared" -> ', """                "wizz_take_action" -> {
+                    result.success(wizzAction)
+                    wizzAction = ""
+                }
+                "wizz_take_shared" -> """)
 save(p, s)
 
 print('wizz multi-session patch applied')
