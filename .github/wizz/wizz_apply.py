@@ -224,19 +224,21 @@ Widget wizzPrivacyButton(BuildContext context, WizzSession s) {
     final on = state.value.isNotEmpty;
     final toggles = toolbarPrivacyMode(state, context, s.id, s.ffi);
     final usable = toggles.any((t) => t.onChanged != null);
-    return GestureDetector(
-      onLongPress: usable && !on
+    // no tooltip: on Android a tooltip takes the long-press for itself
+    return InkResponse(
+      radius: 24,
+      onTap: usable
+          ? () => _wizzTogglePrivacy(context, state, toggles)
+          : () => showToast('Privacy mode is not available on this PC'),
+      onLongPress: usable
           ? () => _wizzChoosePrivacy(context, toggles, remember: true)
           : null,
-      child: IconButton(
-        tooltip: !usable
-            ? 'Privacy mode is not available on this PC'
-            : (on ? 'Privacy on: tap to turn off' : 'Privacy mode'),
-        icon: Icon(on ? Icons.shield : Icons.shield_outlined,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Icon(on ? Icons.shield : Icons.shield_outlined,
             color: on
                 ? MyTheme.accent
                 : (usable ? Colors.grey : Colors.grey.withOpacity(0.35))),
-        onPressed: usable ? () => _wizzTogglePrivacy(context, state, toggles) : null,
       ),
     );
   });
@@ -286,11 +288,22 @@ void _wizzChoosePrivacy(BuildContext context, List<TToggleMenu> toggles,
               subtitle: i < _kWizzPrivacyHelp.length
                   ? Text(_kWizzPrivacyHelp[i])
                   : null,
-              onTap: () {
+              trailing: toggles[i].value
+                  ? const Icon(Icons.check, color: Colors.green)
+                  : null,
+              onTap: () async {
                 Navigator.pop(ctx);
                 if (remember) {
                   bind.mainSetLocalOption(
                       key: 'wizz-privacy-mode', value: i.toString());
+                }
+                if (toggles[i].value) return;
+                // another mode is on: turn it off first, then switch
+                for (final t in toggles) {
+                  if (t.value) {
+                    t.onChanged?.call(false);
+                    await Future.delayed(const Duration(milliseconds: 800));
+                  }
                 }
                 toggles[i].onChanged?.call(true);
               },
