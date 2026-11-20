@@ -685,6 +685,348 @@ void showWizzConnectDialog(BuildContext context) {
 '''
 
 
+WIZZ_SWITCHER_DART = r'''// Wizz: hold the sessions button to see every open PC as a live preview
+// (like hovering over the Windows taskbar). Slide onto one and let go, or let
+// go first and tap one. Optional: swipe the bottom toolbar to change PC.
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+
+import '../../common.dart';
+import '../../common/shared_state.dart';
+import '../../models/model.dart';
+import 'wizz_sessions.dart';
+import 'wizz_settings.dart';
+
+class WizzSessionsButton extends StatefulWidget {
+  final void Function() onTap;
+  const WizzSessionsButton({Key? key, required this.onTap}) : super(key: key);
+
+  @override
+  State<WizzSessionsButton> createState() => _WizzSessionsButtonState();
+}
+
+class _WizzSessionsButtonState extends State<WizzSessionsButton> {
+  OverlayEntry? _entry;
+  final _strip = GlobalKey<_WizzStripState>();
+  bool _dragged = false;
+
+  void _open() {
+    if (WizzSessions.to.sessions.isEmpty) return;
+    HapticFeedback.mediumImpact();
+    final box = context.findRenderObject() as RenderBox?;
+    final top = box == null ? 120.0 : box.localToGlobal(Offset.zero).dy;
+    _dragged = false;
+    _entry = OverlayEntry(
+        builder: (_) => _WizzStrip(key: _strip, bottomEdge: top, onClose: _close));
+    Overlay.of(context).insert(_entry!);
+  }
+
+  void _close() {
+    _entry?.remove();
+    _entry = null;
+  }
+
+  @override
+  void dispose() {
+    _close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTap,
+      onLongPressStart: (_) => _open(),
+      onLongPressMoveUpdate: (d) {
+        _dragged = true;
+        _strip.currentState?.hover(d.globalPosition);
+      },
+      onLongPressEnd: (d) {
+        // slid onto a PC: switch. Otherwise keep the strip open for a tap.
+        final s = _strip.currentState;
+        if (s == null) return;
+        if (_dragged && s.pickAt(d.globalPosition)) return;
+        s.hover(null);
+      },
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: wizzSessionsIcon(),
+      ),
+    );
+  }
+}
+
+class _WizzStrip extends StatefulWidget {
+  final double bottomEdge; // top of the sessions button, in screen pixels
+  final void Function() onClose;
+  const _WizzStrip({Key? key, required this.bottomEdge, required this.onClose})
+      : super(key: key);
+
+  @override
+  State<_WizzStrip> createState() => _WizzStripState();
+}
+
+class _WizzStripState extends State<_WizzStrip> {
+  final List<GlobalKey> _cards = [];
+  int _hover = -1;
+
+  int _indexAt(Offset p) {
+    for (var i = 0; i < _cards.length; i++) {
+      final b = _cards[i].currentContext?.findRenderObject() as RenderBox?;
+      if (b == null || !b.attached) continue;
+      final r = b.localToGlobal(Offset.zero) & b.size;
+      if (r.contains(p)) return i;
+    }
+    return -1;
+  }
+
+  void hover(Offset? p) {
+    final i = p == null ? -1 : _indexAt(p);
+    if (i != _hover) {
+      if (i >= 0) HapticFeedback.selectionClick();
+      setState(() => _hover = i);
+    }
+  }
+
+  bool pickAt(Offset p) {
+    final i = _indexAt(p);
+    if (i < 0) return false;
+    _pick(i);
+    return true;
+  }
+
+  void _pick(int i) {
+    final m = WizzSessions.to;
+    widget.onClose();
+    if (i >= m.sessions.length) {
+      final ctx = globalKey.currentContext;
+      if (ctx != null) showWizzConnectDialog(ctx);
+    } else {
+      m.switchTo(i);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    final wide = size.width > 700; // Fold inner screen, tablets
+    final cardW = wide ? 200.0 : 150.0;
+    return Stack(children: [
+      Positioned.fill(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: widget.onClose,
+          child: Container(color: Colors.black26),
+        ),
+      ),
+      Positioned(
+        left: 0,
+        right: 0,
+        bottom: size.height - widget.bottomEdge + 8,
+        child: Obx(() {
+          final m = WizzSessions.to;
+          final list = m.sessions.toList();
+          final cur = m.current.value;
+          while (_cards.length < list.length + 1) {
+            _cards.add(GlobalKey());
+          }
+          final cards = <Widget>[
+            for (var i = 0; i < list.length; i++)
+              _WizzCard(
+                key: _cards[i],
+                s: list[i],
+                width: cardW,
+                current: i == cur,
+                hover: i == _hover,
+                onTap: () => _pick(i),
+              ),
+            _WizzAddCard(
+                key: _cards[list.length],
+                width: cardW * 0.5,
+                hover: _hover == list.length,
+                onTap: () => _pick(list.length)),
+          ];
+          if (wide) {
+            return ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: size.height * 0.6),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(8),
+                child: Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: cards),
+              ),
+            );
+          }
+          return SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  for (final c in cards)
+                    Padding(padding: const EdgeInsets.only(right: 8), child: c)
+                ]),
+          );
+        }),
+      ),
+    ]);
+  }
+}
+
+class _WizzPreviewPainter extends CustomPainter {
+  final ImageModel model;
+  _WizzPreviewPainter(this.model) : super(repaint: model);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final img = model.image;
+    if (img == null) return;
+    final src = Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble());
+    final fitted = applyBoxFit(BoxFit.contain, src.size, size);
+    final dst = Alignment.center.inscribe(fitted.destination, Offset.zero & size);
+    canvas.drawImageRect(img, src, dst,
+        Paint()..filterQuality = FilterQuality.medium);
+  }
+
+  @override
+  bool shouldRepaint(_WizzPreviewPainter old) => old.model != model;
+}
+
+class _WizzCard extends StatelessWidget {
+  final WizzSession s;
+  final double width;
+  final bool current;
+  final bool hover;
+  final void Function() onTap;
+  const _WizzCard(
+      {Key? key,
+      required this.s,
+      required this.width,
+      required this.current,
+      required this.hover,
+      required this.onTap})
+      : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final dropped = s.dropped.value;
+      final privacy = PrivacyModeState.find(s.id).value.isNotEmpty;
+      final border = dropped
+          ? Colors.red
+          : hover
+              ? Colors.white
+              : current
+                  ? Colors.lightBlueAccent
+                  : Colors.white24;
+      return GestureDetector(
+        onTap: onTap,
+        onLongPress: () => showToast(
+            s.title == s.id ? s.id : '${s.title}\n${s.id}'),
+        child: AnimatedScale(
+          scale: hover ? 1.06 : 1.0,
+          duration: const Duration(milliseconds: 100),
+          child: Container(
+            width: width,
+            decoration: BoxDecoration(
+              color: const Color(0xEE202020),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: border, width: hover || current || dropped ? 2.5 : 1),
+            ),
+            padding: const EdgeInsets.all(6),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              AspectRatio(
+                aspectRatio: 16 / 9,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Stack(fit: StackFit.expand, children: [
+                    Container(color: Colors.black),
+                    CustomPaint(painter: _WizzPreviewPainter(s.ffi.imageModel)),
+                    if (dropped)
+                      Container(
+                        color: Colors.black54,
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.link_off, color: Colors.red, size: 28),
+                      ),
+                    if (privacy)
+                      const Positioned(
+                        right: 4,
+                        top: 4,
+                        child: Icon(Icons.shield,
+                            size: 16, color: Colors.lightGreenAccent, shadows: kWizzTextOutline),
+                      ),
+                  ]),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(s.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color: dropped ? Colors.redAccent : Colors.white,
+                      fontSize: 12,
+                      fontWeight: current ? FontWeight.bold : FontWeight.normal)),
+            ]),
+          ),
+        ),
+      );
+    });
+  }
+}
+
+class _WizzAddCard extends StatelessWidget {
+  final double width;
+  final bool hover;
+  final void Function() onTap;
+  const _WizzAddCard(
+      {Key? key, required this.width, required this.hover, required this.onTap})
+      : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: width,
+        height: width * 1.2,
+        decoration: BoxDecoration(
+          color: const Color(0xEE202020),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: hover ? Colors.white : Colors.white24, width: hover ? 2.5 : 1),
+        ),
+        child: const Icon(Icons.add, color: Colors.white, size: 30),
+      ),
+    );
+  }
+}
+
+/// Swipe the bottom toolbar left/right to go to the next/previous PC
+/// (Settings → Multiview → Switching).
+Widget wizzSwipeSwitch(Widget toolbar) {
+  if (!WizzPrefs.swipeSwitch) return toolbar;
+  return GestureDetector(
+    onHorizontalDragEnd: (d) {
+      final v = d.primaryVelocity ?? 0;
+      if (v.abs() < 300) return;
+      final m = WizzSessions.to;
+      if (m.sessions.length < 2) return;
+      final n = m.sessions.length;
+      final i = (m.current.value + (v < 0 ? 1 : -1) + n) % n;
+      HapticFeedback.selectionClick();
+      m.switchTo(i);
+      showToast(m.sessions[i].title);
+    },
+    child: toolbar,
+  );
+}
+'''
+
 WIZZ_SETTINGS_DART = r'''// Wizz: Multiview settings (app lock, favourite keys, file copy & paste),
 // the app lock itself and the favourite-keys catalogue.
 import 'dart:async';
@@ -730,6 +1072,10 @@ class WizzPrefs {
   static set askEach(bool v) => _set('save-ask', v ? 'Y' : 'N');
   static int get autoDeleteHours => _int('auto-delete', 0);
   static set autoDeleteHours(int v) => _set('auto-delete', '$v');
+
+  // switching PCs
+  static bool get swipeSwitch => _get('swipe-switch', 'N') == 'Y';
+  static set swipeSwitch(bool v) => _set('swipe-switch', v ? 'Y' : 'N');
 
   // keys
   static int get keysSeeThrough => _int('keys-see', 33);
@@ -1139,6 +1485,16 @@ SettingsSection wizzSettingsSection(BuildContext context, void Function() refres
       leading: const Icon(Icons.lock_outline),
       onPressed: (c) async {
         await Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzLockSettingsPage()));
+        refresh();
+      },
+    ),
+    SettingsTile.switchTile(
+      title: const Text('Swipe the toolbar to switch PC'),
+      description: const Text('Swipe the bottom bar left or right for the next or previous PC'),
+      leading: const Icon(Icons.swipe),
+      initialValue: WizzPrefs.swipeSwitch,
+      onToggle: (v) {
+        WizzPrefs.swipeSwitch = v;
         refresh();
       },
     ),
@@ -2936,6 +3292,27 @@ p = 'flutter/android/app/src/main/AndroidManifest.xml'
 s = load(p)
 s = rep(s, '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />\n',
         '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />\n    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n')
+save(p, s)
+
+# ===== Wizz: hold the sessions button for live previews; optional toolbar swipe =====
+save('flutter/lib/mobile/pages/wizz_switcher.dart', WIZZ_SWITCHER_DART)
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, "import 'wizz_settings.dart';\n", "import 'wizz_settings.dart';\nimport 'wizz_switcher.dart';\n")
+s = rep(s, """                    IconButton(
+                      color: Colors.white,
+                      icon: wizzSessionsIcon(),
+                      onPressed: () {
+                        setState(() => _showEdit = false);
+                        showWizzSessionsMenu(context);
+                      },
+                    ),
+""", """                    WizzSessionsButton(onTap: () {
+                      setState(() => _showEdit = false);
+                      showWizzSessionsMenu(context);
+                    }),
+""")
+s = rep(s, "? getBottomAppBar()", "? wizzSwipeSwitch(getBottomAppBar())")
 save(p, s)
 
 print('wizz multi-session patch applied')
