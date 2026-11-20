@@ -685,6 +685,729 @@ void showWizzConnectDialog(BuildContext context) {
 '''
 
 
+WIZZ_SETTINGS_DART = r'''// Wizz: Multiview settings (app lock, favourite keys, file copy & paste),
+// the app lock itself and the favourite-keys catalogue.
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:settings_ui/settings_ui.dart';
+
+import '../../common.dart';
+import '../../models/model.dart';
+import '../../models/platform_model.dart';
+import 'remote_page.dart' show sendPrompt;
+
+// ------------------------------------------------------------------ prefs
+class WizzPrefs {
+  static String _get(String k, String d) {
+    final v = bind.mainGetLocalOption(key: 'wizz-$k');
+    return v.isEmpty ? d : v;
+  }
+
+  static void _set(String k, String v) =>
+      bind.mainSetLocalOption(key: 'wizz-$k', value: v);
+
+  static int _int(String k, int d) => int.tryParse(_get(k, '$d')) ?? d;
+
+  // file copy & paste
+  static int get barSeeThrough => _int('bar-see', 60);
+  static set barSeeThrough(int v) => _set('bar-see', '$v');
+  static bool get barBottom => _get('bar-pos', 'top') == 'bottom';
+  static set barBottom(bool v) => _set('bar-pos', v ? 'bottom' : 'top');
+  static int get autoHide => _int('bar-hide', 0);
+  static set autoHide(int v) => _set('bar-hide', '$v');
+  static String get saveFolder => _get('save-folder', 'dl_rd');
+  static set saveFolder(String v) => _set('save-folder', v);
+  static String get customTree => _get('save-tree', '');
+  static set customTree(String v) => _set('save-tree', v);
+  static String get customTreeName => _get('save-tree-name', '');
+  static set customTreeName(String v) => _set('save-tree-name', v);
+  static bool get askEach => _get('save-ask', 'N') == 'Y';
+  static set askEach(bool v) => _set('save-ask', v ? 'Y' : 'N');
+  static int get autoDeleteHours => _int('auto-delete', 0);
+  static set autoDeleteHours(int v) => _set('auto-delete', '$v');
+
+  // keys
+  static int get keysSeeThrough => _int('keys-see', 33);
+  static set keysSeeThrough(int v) => _set('keys-see', '$v');
+  static List<String> get favKeys =>
+      _get('fav-keys', kWizzDefaultKeys.join(',')).split(',')
+        ..removeWhere((e) => !kWizzKeys.containsKey(e));
+  static set favKeys(List<String> v) => _set('fav-keys', v.join(','));
+
+  // lock
+  static bool get lockOn => _get('lock', 'N') == 'Y';
+  static set lockOn(bool v) => _set('lock', v ? 'Y' : 'N');
+  static String get lockHash => _get('lock-pin', '');
+  static set lockHash(String v) => _set('lock-pin', v);
+  static int get lockAfter => _int('lock-after', 60);
+  static set lockAfter(int v) => _set('lock-after', '$v');
+}
+
+String wizzPinHash(String pin) =>
+    sha256.convert(utf8.encode('wizz-multiview:$pin')).toString();
+
+/// Labels that stay readable on any background (used with see-through bars).
+const List<Shadow> kWizzTextOutline = [
+  Shadow(blurRadius: 2, color: Colors.black),
+  Shadow(offset: Offset(1, 1), blurRadius: 1, color: Colors.black),
+  Shadow(offset: Offset(-1, -1), blurRadius: 1, color: Colors.black),
+];
+
+Color wizzBarColor(int seeThroughPercent) =>
+    Colors.black.withOpacity((100 - seeThroughPercent.clamp(0, 100)) / 100.0);
+
+// ------------------------------------------------------- favourite keys
+class WizzKey {
+  final String label;
+  final IconData? icon;
+  final bool modifier; // Ctrl/Alt/Shift/Win: toggles
+  final void Function(FFI ffi, bool isMac) run;
+  const WizzKey(this.label, this.run, {this.icon, this.modifier = false});
+}
+
+void _wizzKey(FFI f, String k) => f.inputModel.inputKey(k);
+
+void _wizzChord(FFI f, String key, {bool ctrl = false, bool alt = false, bool shift = false}) {
+  final im = f.inputModel;
+  final c = im.ctrl, a = im.alt, s = im.shift;
+  if (ctrl) im.ctrl = true;
+  if (alt) im.alt = true;
+  if (shift) im.shift = true;
+  im.inputKey(key);
+  im.ctrl = c;
+  im.alt = a;
+  im.shift = s;
+}
+
+final Map<String, WizzKey> kWizzKeys = {
+  'ctrl': WizzKey('Ctrl', (f, m) => f.inputModel.ctrl = !f.inputModel.ctrl, modifier: true),
+  'alt': WizzKey('Alt', (f, m) => f.inputModel.alt = !f.inputModel.alt, modifier: true),
+  'shift': WizzKey('Shift', (f, m) => f.inputModel.shift = !f.inputModel.shift, modifier: true),
+  'win': WizzKey('Win', (f, m) => f.inputModel.command = !f.inputModel.command, modifier: true),
+  'left': WizzKey('←', (f, m) => _wizzKey(f, 'VK_LEFT'), icon: Icons.keyboard_arrow_left),
+  'up': WizzKey('↑', (f, m) => _wizzKey(f, 'VK_UP'), icon: Icons.keyboard_arrow_up),
+  'down': WizzKey('↓', (f, m) => _wizzKey(f, 'VK_DOWN'), icon: Icons.keyboard_arrow_down),
+  'right': WizzKey('→', (f, m) => _wizzKey(f, 'VK_RIGHT'), icon: Icons.keyboard_arrow_right),
+  'esc': WizzKey('Esc', (f, m) => _wizzKey(f, 'VK_ESCAPE')),
+  'tab': WizzKey('Tab', (f, m) => _wizzKey(f, 'VK_TAB')),
+  'enter': WizzKey('Enter', (f, m) => _wizzKey(f, 'VK_ENTER')),
+  'del': WizzKey('Del', (f, m) => _wizzKey(f, 'VK_DELETE')),
+  'home': WizzKey('Home', (f, m) => _wizzKey(f, 'VK_HOME')),
+  'end': WizzKey('End', (f, m) => _wizzKey(f, 'VK_END')),
+  'pgup': WizzKey('PgUp', (f, m) => _wizzKey(f, 'VK_PRIOR')),
+  'pgdn': WizzKey('PgDn', (f, m) => _wizzKey(f, 'VK_NEXT')),
+  'f5': WizzKey('F5', (f, m) => _wizzKey(f, 'VK_F5')),
+  'prtscr': WizzKey('PrtScr', (f, m) => _wizzKey(f, 'VK_SNAPSHOT')),
+  'ctrl_a': WizzKey('Ctrl+A', (f, m) => sendPrompt(m, 'VK_A', ffi: f)),
+  'ctrl_c': WizzKey('Ctrl+C', (f, m) => sendPrompt(m, 'VK_C', ffi: f)),
+  'ctrl_v': WizzKey('Ctrl+V', (f, m) => sendPrompt(m, 'VK_V', ffi: f)),
+  'ctrl_x': WizzKey('Ctrl+X', (f, m) => sendPrompt(m, 'VK_X', ffi: f)),
+  'ctrl_z': WizzKey('Ctrl+Z', (f, m) => sendPrompt(m, 'VK_Z', ffi: f)),
+  'ctrl_s': WizzKey('Ctrl+S', (f, m) => sendPrompt(m, 'VK_S', ffi: f)),
+  'alt_tab': WizzKey('Alt+Tab', (f, m) => _wizzChord(f, 'VK_TAB', alt: true)),
+  'alt_f4': WizzKey('Alt+F4', (f, m) => _wizzChord(f, 'VK_F4', alt: true)),
+  'task_mgr': WizzKey('Ctrl+Shift+Esc',
+      (f, m) => _wizzChord(f, 'VK_ESCAPE', ctrl: true, shift: true)),
+  'cad': WizzKey('Ctrl+Alt+Del', (f, m) => bind.sessionCtrlAltDel(sessionId: f.sessionId)),
+};
+
+const List<String> kWizzDefaultKeys = [
+  'left', 'up', 'down', 'right', 'ctrl_a', 'ctrl_c', 'ctrl_v', 'esc', 'enter'
+];
+
+// ------------------------------------------------------- save locations
+const Map<String, String> kWizzFolders = {
+  'dl_rd': 'Download/RustDesk',
+  'dl': 'Download',
+  'docs': 'Documents/RustDesk',
+  'pics': 'Pictures/RustDesk',
+};
+
+class WizzSaveTarget {
+  final String path; // where the download is written
+  final String tree; // custom folder (Android document tree), or ''
+  final String label;
+  WizzSaveTarget(this.path, this.tree, this.label);
+}
+
+Future<WizzSaveTarget?> _wizzTargetFor(String key) async {
+  if (key == 'custom') {
+    if (WizzPrefs.customTree.isEmpty) return null;
+    final d = await getExternalStorageDirectory();
+    final dir = Directory('${d?.path ?? '/storage/emulated/0/Android'}/wizz_dl');
+    try {
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    } catch (_) {}
+    return WizzSaveTarget(dir.path, WizzPrefs.customTree, WizzPrefs.customTreeName);
+  }
+  final rel = kWizzFolders[key] ?? kWizzFolders['dl_rd']!;
+  return WizzSaveTarget('/storage/emulated/0/$rel', '', rel);
+}
+
+Future<bool> wizzPickCustomFolder() async {
+  final r = await gFFI.invokeMethodWithResult<Map<dynamic, dynamic>>('wizz_pick_tree');
+  if (r == null || (r['uri'] ?? '').toString().isEmpty) return false;
+  WizzPrefs.customTree = r['uri'].toString();
+  WizzPrefs.customTreeName = (r['name'] ?? 'Custom folder').toString();
+  return true;
+}
+
+/// Where to save a download: the saved choice, or asks if the user wants that.
+Future<WizzSaveTarget?> wizzChooseSaveTarget(BuildContext context) async {
+  if (!WizzPrefs.askEach) {
+    final t = await _wizzTargetFor(WizzPrefs.saveFolder);
+    if (t != null) return t;
+    return _wizzTargetFor('dl_rd');
+  }
+  final key = await showModalBottomSheet<String>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const ListTile(title: Text('Save to', style: TextStyle(fontWeight: FontWeight.bold))),
+        for (final e in kWizzFolders.entries)
+          ListTile(
+            leading: const Icon(Icons.folder_outlined),
+            title: Text(e.value),
+            trailing: WizzPrefs.saveFolder == e.key ? const Icon(Icons.check) : null,
+            onTap: () => Navigator.pop(ctx, e.key),
+          ),
+        if (WizzPrefs.customTree.isNotEmpty)
+          ListTile(
+            leading: const Icon(Icons.folder_special_outlined),
+            title: Text(WizzPrefs.customTreeName),
+            trailing: WizzPrefs.saveFolder == 'custom' ? const Icon(Icons.check) : null,
+            onTap: () => Navigator.pop(ctx, 'custom'),
+          ),
+        ListTile(
+          leading: const Icon(Icons.create_new_folder_outlined),
+          title: const Text('Other folder…'),
+          onTap: () => Navigator.pop(ctx, 'pick'),
+        ),
+      ]),
+    ),
+  );
+  if (key == null) return null;
+  if (key == 'pick') {
+    if (!await wizzPickCustomFolder()) return null;
+    return _wizzTargetFor('custom');
+  }
+  return _wizzTargetFor(key);
+}
+
+// ------------------------------------------------ auto-delete of downloads
+void wizzRememberDownload(List<String> items, {bool uris = false}) {
+  final now = DateTime.now().millisecondsSinceEpoch;
+  final list = _wizzHistory();
+  for (final i in items) {
+    list.add({'k': uris ? 'u' : 'p', 'v': i, 't': now});
+  }
+  bind.mainSetLocalOption(key: 'wizz-dl-history', value: jsonEncode(list));
+}
+
+List<Map<String, dynamic>> _wizzHistory() {
+  try {
+    final v = bind.mainGetLocalOption(key: 'wizz-dl-history');
+    if (v.isEmpty) return [];
+    return (jsonDecode(v) as List).cast<Map<String, dynamic>>();
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Deletes downloads older than the chosen limit (never, 24 h, 7 days).
+Future<void> wizzAutoDeleteDownloads() async {
+  final hours = WizzPrefs.autoDeleteHours;
+  if (hours <= 0) return;
+  final limit = DateTime.now().millisecondsSinceEpoch - hours * 3600 * 1000;
+  final keep = <Map<String, dynamic>>[];
+  final uris = <String>[];
+  for (final e in _wizzHistory()) {
+    if ((e['t'] as num) > limit) {
+      keep.add(e);
+      continue;
+    }
+    final v = e['v'].toString();
+    if (e['k'] == 'u') {
+      uris.add(v);
+    } else {
+      try {
+        final t = FileSystemEntity.typeSync(v);
+        if (t == FileSystemEntityType.directory) {
+          Directory(v).deleteSync(recursive: true);
+        } else if (t == FileSystemEntityType.file) {
+          File(v).deleteSync();
+        }
+      } catch (_) {}
+    }
+  }
+  if (uris.isNotEmpty) {
+    await gFFI.invokeMethodWithResult('wizz_tree_delete', uris);
+  }
+  bind.mainSetLocalOption(key: 'wizz-dl-history', value: jsonEncode(keep));
+}
+
+// ------------------------------------------------------------- app lock
+class WizzLock with WidgetsBindingObserver {
+  static final WizzLock to = WizzLock._();
+  WizzLock._();
+  bool _started = false;
+  bool _locked = false;
+  DateTime? _away;
+
+  void start() {
+    if (_started) return;
+    _started = true;
+    WidgetsBinding.instance.addObserver(this);
+    wizzAutoDeleteDownloads();
+    if (WizzPrefs.lockOn) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => lock());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+      _away ??= DateTime.now();
+    } else if (state == AppLifecycleState.resumed) {
+      final away = _away;
+      _away = null;
+      if (!WizzPrefs.lockOn || _locked || away == null) return;
+      // "immediately" still allows a few seconds (file pickers, the share menu)
+      final limit = WizzPrefs.lockAfter <= 0 ? 10 : WizzPrefs.lockAfter;
+      if (DateTime.now().difference(away).inSeconds >= limit) lock();
+    }
+  }
+
+  void lock() {
+    if (_locked) return;
+    final nav = globalKey.currentState;
+    if (nav == null) return;
+    _locked = true;
+    nav
+        .push(MaterialPageRoute(
+            fullscreenDialog: true, builder: (_) => const WizzLockPage()))
+        .then((_) => _locked = false);
+  }
+}
+
+/// Fingerprint first, PIN as the fallback. Returns true when unlocked.
+class WizzLockPage extends StatefulWidget {
+  final bool verifyOnly;
+  const WizzLockPage({Key? key, this.verifyOnly = false}) : super(key: key);
+
+  @override
+  State<WizzLockPage> createState() => _WizzLockPageState();
+}
+
+class _WizzLockPageState extends State<WizzLockPage> {
+  final _pin = TextEditingController();
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _fingerprint());
+  }
+
+  Future<void> _fingerprint() async {
+    final ok = await gFFI.invokeMethodWithResult<bool>('wizz_biometric') ?? false;
+    if (ok && mounted) Navigator.pop(context, true);
+  }
+
+  void _check() {
+    if (wizzPinHash(_pin.text) == WizzPrefs.lockHash) {
+      Navigator.pop(context, true);
+    } else {
+      setState(() {
+        _error = 'Wrong PIN';
+        _pin.clear();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: () async => widget.verifyOnly,
+      child: Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(32),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.lock_outline, size: 64),
+                const SizedBox(height: 16),
+                Text(widget.verifyOnly ? 'Confirm it\'s you' : 'RustDesk Multiview is locked',
+                    style: const TextStyle(fontSize: 18)),
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: 220,
+                  child: TextField(
+                    controller: _pin,
+                    autofocus: false,
+                    obscureText: true,
+                    keyboardType: TextInputType.number,
+                    textAlign: TextAlign.center,
+                    maxLength: 8,
+                    decoration: InputDecoration(
+                        hintText: 'PIN', errorText: _error.isEmpty ? null : _error),
+                    onSubmitted: (_) => _check(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                ElevatedButton(onPressed: _check, child: const Text('Unlock')),
+                const SizedBox(height: 16),
+                TextButton.icon(
+                    onPressed: _fingerprint,
+                    icon: const Icon(Icons.fingerprint),
+                    label: const Text('Use fingerprint')),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<bool> _wizzVerify(BuildContext context) async {
+  if (WizzPrefs.lockHash.isEmpty) return true;
+  final r = await Navigator.push<bool>(context,
+      MaterialPageRoute(builder: (_) => const WizzLockPage(verifyOnly: true)));
+  return r == true;
+}
+
+Future<String?> _wizzAskNewPin(BuildContext context) async {
+  final a = TextEditingController(), b = TextEditingController();
+  String err = '';
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setState) => AlertDialog(
+        title: const Text('Set a PIN'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+              controller: a,
+              obscureText: true,
+              keyboardType: TextInputType.number,
+              maxLength: 8,
+              decoration: const InputDecoration(labelText: 'New PIN (4-8 digits)')),
+          TextField(
+              controller: b,
+              obscureText: true,
+              keyboardType: TextInputType.number,
+              maxLength: 8,
+              decoration: InputDecoration(
+                  labelText: 'Repeat PIN', errorText: err.isEmpty ? null : err)),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () {
+                if (!RegExp(r'^\d{4,8}$').hasMatch(a.text)) {
+                  setState(() => err = 'Use 4 to 8 digits');
+                } else if (a.text != b.text) {
+                  setState(() => err = 'The PINs don\'t match');
+                } else {
+                  Navigator.pop(ctx, a.text);
+                }
+              },
+              child: const Text('Save')),
+        ],
+      ),
+    ),
+  );
+}
+
+// ------------------------------------------------------------ settings UI
+SettingsSection wizzSettingsSection(BuildContext context, void Function() refresh) {
+  String lockLabel() {
+    if (!WizzPrefs.lockOn) return 'Off';
+    final a = WizzPrefs.lockAfter;
+    return a <= 0 ? 'On · immediately' : 'On · after ${a ~/ 60} min';
+  }
+
+  return SettingsSection(title: const Text('Multiview'), tiles: [
+    SettingsTile(
+      title: const Text('App lock'),
+      value: Text(lockLabel()),
+      leading: const Icon(Icons.lock_outline),
+      onPressed: (c) async {
+        await Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzLockSettingsPage()));
+        refresh();
+      },
+    ),
+    SettingsTile(
+      title: const Text('Extra keys'),
+      value: const Text('Favourites and transparency'),
+      leading: const Icon(Icons.keyboard_outlined),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzKeysSettingsPage())),
+    ),
+    SettingsTile(
+      title: const Text('File copy & paste'),
+      value: const Text('Download bar, save folder, auto-delete'),
+      leading: const Icon(Icons.file_copy_outlined),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzFilesSettingsPage())),
+    ),
+  ]);
+}
+
+class WizzLockSettingsPage extends StatefulWidget {
+  const WizzLockSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzLockSettingsPage> createState() => _WizzLockSettingsPageState();
+}
+
+class _WizzLockSettingsPageState extends State<WizzLockSettingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    const times = {0: 'Immediately', 60: 'After 1 minute', 300: 'After 5 minutes', 900: 'After 15 minutes'};
+    return Scaffold(
+      appBar: AppBar(title: const Text('App lock')),
+      body: ListView(children: [
+        SwitchListTile(
+          title: const Text('Lock the app'),
+          subtitle: const Text('Fingerprint, with your PIN as a backup'),
+          value: WizzPrefs.lockOn,
+          onChanged: (v) async {
+            if (v) {
+              final pin = await _wizzAskNewPin(context);
+              if (pin == null) return;
+              WizzPrefs.lockHash = wizzPinHash(pin);
+              WizzPrefs.lockOn = true;
+            } else {
+              if (!await _wizzVerify(context)) return;
+              WizzPrefs.lockOn = false;
+            }
+            setState(() {});
+          },
+        ),
+        if (WizzPrefs.lockOn) ...[
+          ListTile(
+            title: const Text('Change PIN'),
+            leading: const Icon(Icons.pin_outlined),
+            onTap: () async {
+              if (!await _wizzVerify(context)) return;
+              final pin = await _wizzAskNewPin(context);
+              if (pin == null) return;
+              WizzPrefs.lockHash = wizzPinHash(pin);
+              showToast('PIN changed');
+            },
+          ),
+          const ListTile(title: Text('Lock again when away'), dense: true),
+          for (final e in times.entries)
+            RadioListTile<int>(
+              title: Text(e.value),
+              value: e.key,
+              groupValue: WizzPrefs.lockAfter,
+              onChanged: (v) => setState(() => WizzPrefs.lockAfter = v ?? 60),
+            ),
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('Open PCs stay connected while the app is locked.'),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+class _WizzSlider extends StatelessWidget {
+  final String title;
+  final int value;
+  final ValueChanged<int> onChanged;
+  final String sample;
+  const _WizzSlider(this.title, this.value, this.onChanged, this.sample);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('$title: $value% see-through'),
+        Slider(
+            value: value.toDouble(),
+            min: 0,
+            max: 100,
+            divisions: 20,
+            label: '$value%',
+            onChanged: (v) => onChanged(v.round())),
+        // preview over a light, busy background
+        Container(
+          height: 44,
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(colors: [Colors.white, Colors.lightBlueAccent, Colors.amber]),
+          ),
+          alignment: Alignment.center,
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+                color: wizzBarColor(value), borderRadius: BorderRadius.circular(8)),
+            child: Text(sample,
+                style: const TextStyle(color: Colors.white, shadows: kWizzTextOutline)),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+class WizzKeysSettingsPage extends StatefulWidget {
+  const WizzKeysSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzKeysSettingsPage> createState() => _WizzKeysSettingsPageState();
+}
+
+class _WizzKeysSettingsPageState extends State<WizzKeysSettingsPage> {
+  late List<String> _fav = WizzPrefs.favKeys;
+
+  void _save() => WizzPrefs.favKeys = _fav;
+
+  @override
+  Widget build(BuildContext context) {
+    final others = kWizzKeys.keys.where((k) => !_fav.contains(k)).toList();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Extra keys')),
+      body: ListView(children: [
+        _WizzSlider('Background', WizzPrefs.keysSeeThrough,
+            (v) => setState(() => WizzPrefs.keysSeeThrough = v), 'Ctrl+C   Esc   Enter'),
+        const ListTile(
+          title: Text('Favourite keys', style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: Text('Shown in the slim row. Drag to reorder, untick to remove. '
+              'The ⋯ button shows all keys.'),
+        ),
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          onReorder: (a, b) => setState(() {
+            if (b > a) b--;
+            _fav.insert(b, _fav.removeAt(a));
+            _save();
+          }),
+          children: [
+            for (final k in _fav)
+              CheckboxListTile(
+                key: ValueKey(k),
+                value: true,
+                title: Text(kWizzKeys[k]!.label),
+                secondary: const Icon(Icons.drag_handle),
+                onChanged: (_) => setState(() {
+                  _fav.remove(k);
+                  _save();
+                }),
+              ),
+          ],
+        ),
+        const Divider(),
+        const ListTile(title: Text('More keys'), dense: true),
+        for (final k in others)
+          CheckboxListTile(
+            value: false,
+            title: Text(kWizzKeys[k]!.label),
+            onChanged: (_) => setState(() {
+              _fav.add(k);
+              _save();
+            }),
+          ),
+        TextButton(
+            onPressed: () => setState(() {
+                  _fav = List.of(kWizzDefaultKeys);
+                  _save();
+                }),
+            child: const Text('Reset to default')),
+      ]),
+    );
+  }
+}
+
+class WizzFilesSettingsPage extends StatefulWidget {
+  const WizzFilesSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzFilesSettingsPage> createState() => _WizzFilesSettingsPageState();
+}
+
+class _WizzFilesSettingsPageState extends State<WizzFilesSettingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    const hides = {0: 'Off', 5: 'After 5 seconds', 10: 'After 10 seconds'};
+    const deletes = {0: 'Never', 24: 'After 24 hours', 168: 'After 7 days'};
+    return Scaffold(
+      appBar: AppBar(title: const Text('File copy & paste')),
+      body: ListView(children: [
+        _WizzSlider('Download bar', WizzPrefs.barSeeThrough,
+            (v) => setState(() => WizzPrefs.barSeeThrough = v), 'Downloading 36% · 436 MB'),
+        SwitchListTile(
+          title: const Text('Show the bar at the bottom'),
+          value: WizzPrefs.barBottom,
+          onChanged: (v) => setState(() => WizzPrefs.barBottom = v),
+        ),
+        const ListTile(title: Text('Hide the bar when a download is done'), dense: true),
+        for (final e in hides.entries)
+          RadioListTile<int>(
+            title: Text(e.value),
+            value: e.key,
+            groupValue: WizzPrefs.autoHide,
+            onChanged: (v) => setState(() => WizzPrefs.autoHide = v ?? 0),
+          ),
+        const Divider(),
+        const ListTile(title: Text('Save downloads to'), dense: true),
+        for (final e in kWizzFolders.entries)
+          RadioListTile<String>(
+            title: Text(e.value),
+            value: e.key,
+            groupValue: WizzPrefs.saveFolder,
+            onChanged: (v) => setState(() => WizzPrefs.saveFolder = v ?? 'dl_rd'),
+          ),
+        RadioListTile<String>(
+          title: Text(WizzPrefs.customTree.isEmpty
+              ? 'Custom folder…'
+              : 'Custom: ${WizzPrefs.customTreeName}'),
+          subtitle: WizzPrefs.customTree.isEmpty ? null : const Text('Tap the folder icon to change'),
+          secondary: IconButton(
+              icon: const Icon(Icons.folder_open),
+              onPressed: () async {
+                if (await wizzPickCustomFolder()) {
+                  setState(() => WizzPrefs.saveFolder = 'custom');
+                }
+              }),
+          value: 'custom',
+          groupValue: WizzPrefs.saveFolder,
+          onChanged: (v) async {
+            if (WizzPrefs.customTree.isEmpty && !await wizzPickCustomFolder()) return;
+            setState(() => WizzPrefs.saveFolder = 'custom');
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Ask where to save each time'),
+          value: WizzPrefs.askEach,
+          onChanged: (v) => setState(() => WizzPrefs.askEach = v),
+        ),
+        const Divider(),
+        const ListTile(title: Text('Delete downloads automatically'), dense: true),
+        for (final e in deletes.entries)
+          RadioListTile<int>(
+            title: Text(e.value),
+            value: e.key,
+            groupValue: WizzPrefs.autoDeleteHours,
+            onChanged: (v) => setState(() => WizzPrefs.autoDeleteHours = v ?? 0),
+          ),
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('Only files downloaded by this app are deleted.'),
+        ),
+      ]),
+    );
+  }
+}
+'''
+
+
 def load(p):
     return open(p).read()
 
@@ -1711,5 +2434,508 @@ save('flutter/android/app/src/main/res/xml/wizz_file_paths.xml', """<?xml versio
     <external-files-path name="extfiles" path="." />
 </paths>
 """)
+
+# ===== Wizz: settings (app lock, favourite keys, file copy & paste) =====
+save('flutter/lib/mobile/pages/wizz_settings.dart', WIZZ_SETTINGS_DART)
+
+p = 'flutter/lib/mobile/pages/settings_page.dart'
+s = load(p)
+s = rep(s, "import 'scan_page.dart';\n", "import 'scan_page.dart';\nimport 'wizz_settings.dart';\n")
+s = rep(s, "        customClientSection,\n", "        customClientSection,\n        wizzSettingsSection(context, () => setState(() {})),\n")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/home_page.dart'
+s = load(p)
+s = rep(s, "import 'connection_page.dart';\n", "import 'connection_page.dart';\nimport 'wizz_settings.dart';\n")
+s = rep(s, "    super.initState();\n    initPages();\n", "    super.initState();\n    initPages();\n    WizzLock.to.start();\n")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, "import 'wizz_sessions.dart';\n", "import 'wizz_sessions.dart';\nimport 'wizz_settings.dart';\n")
+
+# -- compact extra keys row: favourites + "⋯" to show everything
+s = rep(s, "  var _pin = false;\n  final _keyboardVisibilityController", "  var _pin = false;\n  var _wizzAll = false;\n  final _keyboardVisibilityController")
+s = rep(s, "            ? Icon(icon, size: 14, color: Colors.white)\n            : Text(translate(text),\n                style: TextStyle(color: Colors.white, fontSize: 11)),",
+        "            ? Icon(icon, size: 14, color: Colors.white, shadows: kWizzTextOutline)\n            : Text(translate(text),\n                style: TextStyle(color: Colors.white, fontSize: 11, shadows: kWizzTextOutline)),")
+s = rep(s, "        color: Color(0xAA000000),\n        padding: EdgeInsets.only(\n            top: _keyboardVisibilityController.isVisible ? 24 : 4, bottom: 8),",
+        "        color: wizzBarColor(WizzPrefs.keysSeeThrough),\n        padding: EdgeInsets.only(\n            top: _keyboardVisibilityController.isVisible ? 24 : 4, bottom: 8),")
+s = rep(s, """          children: <Widget>[SizedBox(width: 9999)] +
+              modifiers +
+              keys +
+              (_fn ? fn : []) +
+              (_more ? more : []),""", """          children: _wizzAll
+              ? <Widget>[SizedBox(width: 9999)] +
+                  modifiers +
+                  keys +
+                  [
+                    wrap('', () => setState(() => _wizzAll = false),
+                        icon: Icons.unfold_less)
+                  ] +
+                  (_fn ? fn : []) +
+                  (_more ? more : [])
+              : <Widget>[SizedBox(width: 9999)] +
+                  _wizzFavs(isMac) +
+                  [
+                    wrap('', () => setState(() => _pin = !_pin),
+                        active: _pin, icon: Icons.push_pin),
+                    wrap(' ⋯ ', () => setState(() => _wizzAll = true)),
+                  ],""")
+s = rep(s, "  _updateRect() {\n    RenderObject? renderObject = _key.currentContext?.findRenderObject();",
+        """  List<Widget> _wizzFavs(bool isMac) {
+    final out = <Widget>[];
+    for (final id in WizzPrefs.favKeys) {
+      final k = kWizzKeys[id];
+      if (k == null) continue;
+      bool? on;
+      switch (id) {
+        case 'ctrl':
+          on = inputModel.ctrl;
+          break;
+        case 'alt':
+          on = inputModel.alt;
+          break;
+        case 'shift':
+          on = inputModel.shift;
+          break;
+        case 'win':
+          on = inputModel.command;
+          break;
+      }
+      out.add(wrap(k.icon != null ? '' : k.label,
+          () => setState(() => k.run(_ffi, isMac)),
+          active: on, icon: k.icon));
+    }
+    return out;
+  }
+
+  _updateRect() {
+    RenderObject? renderObject = _key.currentContext?.findRenderObject();""")
+
+# -- download: pick the folder (saved setting or ask), custom folders via Android
+i = s.index("  Future<void> _wizzClipDownload() async {")
+j = s.index("  String _wizzSize(num b) {", i)
+s = s[:i] + r"""  WizzSaveTarget? _wizzTarget;
+  int _wizzDoneSeq = -1;
+  bool _wizzTreeBusy = false;
+  List<String> _wizzTreeUris = const [];
+  Timer? _wizzHideTimer;
+  int _wizzHideSeq = -1;
+
+  Future<void> _wizzClipDownload() async {
+    final t = await wizzChooseSaveTarget(context);
+    if (t == null || !mounted) return;
+    _wizzTarget = t;
+    _wizzTreeUris = const [];
+    var fallback = '';
+    try {
+      final d = await getExternalStorageDirectory();
+      if (d != null) fallback = '${d.path}/RustDesk';
+    } catch (_) {}
+    _wizzClipCall('wizz-clip-download', '${t.path}\n$fallback');
+    _wizzClipPoll();
+  }
+
+  bool get _wizzToTree => (_wizzTarget?.tree ?? '').isNotEmpty;
+
+  // a download finished: copy into a custom folder, remember it for auto-delete
+  Future<void> _wizzOnDone(Map<String, dynamic> m) async {
+    final seq = (m['seq'] ?? 0) as int;
+    if ((m['state'] ?? '') != 'done' || seq == _wizzDoneSeq) return;
+    _wizzDoneSeq = seq;
+    final saved = ((m['saved'] ?? []) as List).map((e) => e.toString()).toList();
+    wizzRememberDownload(saved);
+    if (_wizzToTree) {
+      setState(() => _wizzTreeBusy = true);
+      final r = await _ffi.invokeMethodWithResult<List<dynamic>>(
+          'wizz_tree_copy', {'tree': _wizzTarget!.tree, 'paths': saved});
+      final uris = (r ?? []).map((e) => e.toString()).toList();
+      wizzRememberDownload(uris, uris: true);
+      if (!mounted) return;
+      setState(() {
+        _wizzTreeBusy = false;
+        _wizzTreeUris = uris;
+      });
+      if (uris.isEmpty) showToast('Could not save to ${_wizzTarget!.label}');
+    }
+  }
+
+  Widget _wizzAct(String label, void Function() onPressed) => TextButton(
+      onPressed: onPressed,
+      child: Text(label,
+          style: const TextStyle(
+              fontWeight: FontWeight.bold, shadows: kWizzTextOutline)));
+
+  Future<void> _wizzConfirmDelete(String what) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text('Delete $what from the phone?'),
+        content: const Text("This can't be undone."),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('Delete', style: TextStyle(color: Colors.red))),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    if (_wizzToTree && _wizzTreeUris.isNotEmpty) {
+      await _ffi.invokeMethodWithResult('wizz_tree_delete', _wizzTreeUris);
+      _wizzTreeUris = const [];
+    }
+    _wizzClipCall('wizz-clip-delete');
+    showToast('Deleted from the phone');
+    _wizzClipPoll();
+  }
+
+""" + s[j:]
+
+# poll hook
+s = rep(s, "        setState(() => _wizzClip = m);\n        _wizzNotify(m);\n",
+        "        setState(() => _wizzClip = m);\n        _wizzNotify(m);\n        _wizzOnDone(m);\n")
+# notification text for custom folders
+s = rep(s, """          'text': 'Saved to $dir · tap to open',
+          'progress': 100,
+          'path': single ? saved.first.toString() : '',""", """          'text': _wizzToTree
+              ? 'Saved to ${_wizzTarget!.label}'
+              : 'Saved to $dir · tap to open',
+          'progress': 100,
+          'path': single && !_wizzToTree ? saved.first.toString() : '',""")
+s = rep(s, "    _wizzClipTimer?.cancel();\n", "    _wizzClipTimer?.cancel();\n    _wizzHideTimer?.cancel();\n")
+
+# the bar itself: transparency, position, auto-hide, delete confirmation
+i = s.index("  Widget _wizzClipBanner() {")
+j = s.index("  // Background PCs: clipboard off", i)
+s = s[:i] + r"""  Widget _wizzClipBanner() {
+    final st = (_wizzClip['state'] ?? 'idle').toString();
+    final seq = (_wizzClip['seq'] ?? 0) as int;
+    if (st == 'idle' ||
+        (seq == _wizzClipHiddenSeq && st == _wizzClipHiddenState)) {
+      return const SizedBox.shrink();
+    }
+    final count = (_wizzClip['count'] ?? 0) as int;
+    final bytes = (_wizzClip['bytes'] ?? 0) as num;
+    final done = (_wizzClip['done'] ?? 0) as num;
+    final names = ((_wizzClip['names'] ?? []) as List).cast<dynamic>();
+    final what =
+        count == 1 && names.isNotEmpty ? names.first.toString() : '$count items';
+    final dir = (_wizzClip['dir'] ?? '')
+        .toString()
+        .replaceFirst('/storage/emulated/0/', '');
+    final msg = (_wizzClip['msg'] ?? '').toString();
+    String text;
+    double? progress;
+    final actions = <Widget>[];
+    switch (st) {
+      case 'offered':
+        text = 'Copied on PC: $what (${_wizzSize(bytes)})';
+        actions.add(_wizzAct('Download', _wizzClipDownload));
+        break;
+      case 'downloading':
+        final pv = bytes > 0 ? (done / bytes).clamp(0.0, 1.0).toDouble() : 0.0;
+        progress = bytes > 0 ? pv : null;
+        final pct = bytes > 0 ? '${(pv * 100).toStringAsFixed(0)}% · ' : '';
+        text = 'Downloading $pct${_wizzSize(done)} / ${_wizzSize(bytes)}';
+        actions.add(_wizzAct('Cancel', () => _wizzClipCall('wizz-clip-cancel')));
+        break;
+      case 'done':
+        final saved = ((_wizzClip['saved'] ?? []) as List).cast<dynamic>();
+        final single = msg == 'single' && saved.length == 1;
+        if (_wizzToTree && _wizzTreeBusy) {
+          text = 'Saving to ${_wizzTarget!.label}…';
+          progress = null;
+          break;
+        }
+        if (_wizzToTree) {
+          text = 'Saved to ${_wizzTarget!.label}';
+          actions.add(_wizzAct(single ? 'Open' : 'Show', () {
+            if (single && _wizzTreeUris.length == 1) {
+              _ffi.invokeMethod("wizz_open_uri", _wizzTreeUris.first);
+            } else {
+              _ffi.invokeMethod("wizz_open_uri", _wizzTarget!.tree);
+            }
+          }));
+        } else {
+          text = 'Saved to $dir';
+          actions.add(_wizzAct(single ? 'Open' : 'Show', () {
+            if (single) {
+              _ffi.invokeMethod("wizz_open_file", saved.first.toString());
+            } else {
+              _ffi.invokeMethod("wizz_show_downloads");
+            }
+          }));
+        }
+        actions.add(_wizzAct('Delete', () => _wizzConfirmDelete(what)));
+        final hide = WizzPrefs.autoHide;
+        if (hide > 0 && _wizzHideSeq != seq) {
+          _wizzHideSeq = seq;
+          _wizzHideTimer?.cancel();
+          _wizzHideTimer = Timer(Duration(seconds: hide), () {
+            if (!mounted) return;
+            setState(() {
+              _wizzClipHiddenSeq = seq;
+              _wizzClipHiddenState = 'done';
+            });
+          });
+        }
+        break;
+      default:
+        text = 'Download failed: $msg';
+    }
+    final atBottom = WizzPrefs.barBottom;
+    return Positioned(
+      top: atBottom ? null : 8,
+      bottom: atBottom ? 8 : null,
+      left: 8,
+      right: 8,
+      child: Material(
+        color: wizzBarColor(WizzPrefs.barSeeThrough),
+        borderRadius: BorderRadius.circular(10),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.file_copy,
+                      color: Colors.white, size: 18, shadows: kWizzTextOutline),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(text,
+                        style: const TextStyle(
+                            color: Colors.white, shadows: kWizzTextOutline),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis),
+                  ),
+                  ...actions,
+                  IconButton(
+                    icon: const Icon(Icons.close,
+                        color: Colors.white, shadows: kWizzTextOutline),
+                    onPressed: () {
+                      if (st != 'downloading') {
+                        _wizzClipCall('wizz-clip-dismiss');
+                      }
+                      setState(() {
+                        _wizzClipHiddenSeq = seq;
+                        _wizzClipHiddenState = st;
+                      });
+                    },
+                  ),
+                ],
+              ),
+              if (st == 'downloading' || (st == 'done' && _wizzTreeBusy))
+                Padding(
+                  padding: const EdgeInsets.only(right: 8, bottom: 6),
+                  child: LinearProgressIndicator(value: progress),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+""" + s[j:]
+save(p, s)
+
+# -- Android: fingerprint, custom folders
+save(kt + 'WizzLock.kt', """package com.carriez.flutter_hbb
+
+import android.annotation.TargetApi
+import android.app.Activity
+import android.content.Context
+import android.hardware.biometrics.BiometricPrompt
+import android.net.Uri
+import android.os.CancellationSignal
+import android.provider.DocumentsContract
+import android.util.Log
+import android.webkit.MimeTypeMap
+import java.io.File
+
+object WizzLock {
+    @TargetApi(28)
+    fun biometric(activity: Activity, done: (Boolean) -> Unit) {
+        var replied = false
+        val reply = { ok: Boolean ->
+            if (!replied) {
+                replied = true
+                done(ok)
+            }
+        }
+        try {
+            val ex = activity.mainExecutor
+            val prompt = BiometricPrompt.Builder(activity)
+                .setTitle("Unlock RustDesk Multiview")
+                .setNegativeButton("Use PIN", ex) { _, _ -> reply(false) }
+                .build()
+            prompt.authenticate(CancellationSignal(), ex,
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult?) {
+                        reply(true)
+                    }
+
+                    override fun onAuthenticationError(code: Int, msg: CharSequence?) {
+                        reply(false)
+                    }
+                })
+        } catch (e: Exception) {
+            Log.e("Wizz", "biometric: $e")
+            reply(false)
+        }
+    }
+
+    fun treeName(uri: Uri): String {
+        return try {
+            val id = DocumentsContract.getTreeDocumentId(uri)
+            val rel = id.substringAfter(':', "")
+            if (rel.isEmpty()) "Phone storage" else rel
+        } catch (e: Exception) {
+            "Custom folder"
+        }
+    }
+
+    private fun mimeOf(f: File): String =
+        MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase())
+            ?: "application/octet-stream"
+
+    private fun copyInto(ctx: Context, parent: Uri, f: File): Uri? {
+        val cr = ctx.contentResolver
+        if (f.isDirectory) {
+            val d = DocumentsContract.createDocument(cr, parent,
+                DocumentsContract.Document.MIME_TYPE_DIR, f.name) ?: return null
+            f.listFiles()?.forEach { copyInto(ctx, d, it) }
+            return d
+        }
+        val u = DocumentsContract.createDocument(cr, parent, mimeOf(f), f.name) ?: return null
+        cr.openOutputStream(u)?.use { out -> f.inputStream().use { it.copyTo(out, 1 shl 20) } }
+        return u
+    }
+
+    /** Copies downloaded files into a folder the user picked; returns the new items. */
+    fun copyToTree(ctx: Context, tree: String, paths: List<String>): List<String> {
+        val out = mutableListOf<String>()
+        try {
+            val t = Uri.parse(tree)
+            val root = DocumentsContract.buildDocumentUriUsingTree(t,
+                DocumentsContract.getTreeDocumentId(t))
+            for (p in paths) {
+                try {
+                    copyInto(ctx, root, File(p))?.let { out.add(it.toString()) }
+                } catch (e: Exception) {
+                    Log.e("Wizz", "tree copy $p: $e")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("Wizz", "tree copy: $e")
+        }
+        return out
+    }
+
+    fun deleteUris(ctx: Context, uris: List<String>) {
+        for (u in uris) {
+            try {
+                DocumentsContract.deleteDocument(ctx.contentResolver, Uri.parse(u))
+            } catch (e: Exception) {
+                Log.e("Wizz", "tree delete: $e")
+            }
+        }
+    }
+}
+""")
+
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, "    private var wizzPickResult: MethodChannel.Result? = null\n",
+        "    private var wizzPickResult: MethodChannel.Result? = null\n    private var wizzTreeResult: MethodChannel.Result? = null\n")
+s = rep(s, "        if (requestCode == 7310) {\n", """        if (requestCode == 7311) {
+            val r = wizzTreeResult ?: return
+            wizzTreeResult = null
+            val uri = data?.data
+            if (resultCode != Activity.RESULT_OK || uri == null) {
+                r.success(null)
+                return
+            }
+            try {
+                contentResolver.takePersistableUriPermission(uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            } catch (e: Exception) {
+                Log.e("Wizz", "tree permission: $e")
+            }
+            r.success(mapOf("uri" to uri.toString(), "name" to WizzLock.treeName(uri)))
+            return
+        }
+        if (requestCode == 7310) {
+""")
+s = rep(s, '                "wizz_take_shared" -> ', """                "wizz_biometric" -> {
+                    if (Build.VERSION.SDK_INT < 28) {
+                        result.success(false)
+                    } else {
+                        WizzLock.biometric(this) { ok -> result.success(ok) }
+                    }
+                }
+                "wizz_pick_tree" -> {
+                    wizzTreeResult = result
+                    try {
+                        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION), 7311)
+                    } catch (e: Exception) {
+                        wizzTreeResult = null
+                        result.success(null)
+                    }
+                }
+                "wizz_tree_copy" -> {
+                    val a = call.arguments as Map<*, *>
+                    val tree = a["tree"] as String
+                    val paths = (a["paths"] as List<*>).map { it.toString() }
+                    thread {
+                        val out = WizzLock.copyToTree(this, tree, paths)
+                        runOnUiThread { result.success(out) }
+                    }
+                }
+                "wizz_tree_delete" -> {
+                    val uris = (call.arguments as List<*>).map { it.toString() }
+                    thread {
+                        WizzLock.deleteUris(this, uris)
+                        runOnUiThread { result.success(true) }
+                    }
+                }
+                "wizz_open_uri" -> {
+                    try {
+                        var uri = Uri.parse(call.arguments as String)
+                        var mime = contentResolver.getType(uri)
+                        if (uri.pathSegments.size == 2 && uri.pathSegments[0] == "tree") {
+                            uri = DocumentsContract.buildDocumentUriUsingTree(uri,
+                                DocumentsContract.getTreeDocumentId(uri))
+                            mime = DocumentsContract.Document.MIME_TYPE_DIR
+                        }
+                        val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime ?: "*/*")
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(Intent.createChooser(i, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "open uri: $e")
+                        try {
+                            startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (e2: Exception) {
+                        }
+                        result.success(false)
+                    }
+                }
+                "wizz_take_shared" -> """)
+save(p, s)
+
+p = 'flutter/android/app/src/main/AndroidManifest.xml'
+s = load(p)
+s = rep(s, '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />\n',
+        '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />\n    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n')
+save(p, s)
 
 print('wizz multi-session patch applied')
