@@ -1145,7 +1145,7 @@ s = rep(s, "  // Background PCs: clipboard off", r"""  // ---- file copy & paste
       left: 8,
       right: 8,
       child: Material(
-        color: Colors.black.withOpacity(0.55),
+        color: Colors.black.withOpacity(0.40),
         borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
