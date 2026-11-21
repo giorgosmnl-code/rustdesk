@@ -1100,6 +1100,8 @@ void wizzMinimize() {
   stateGlobal.isInMainPage = true;
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
       overlays: SystemUiOverlay.values);
+  // The remote page blocks the soft keyboard; the home screen needs it.
+  gFFI.invokeMethod("enable_soft_keyboard", true);
   final r = MaterialPageRoute(builder: (_) => HomePage(wizzMini: true));
   _wizzMiniRoute = r;
   nav.push(r).then((_) {
@@ -1121,6 +1123,19 @@ void _wizzBackToSessions() {
   stateGlobal.isInMainPage = false;
   if (m.hostMounted) {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
+    gFFI.invokeMethod("enable_soft_keyboard", false);
+  }
+}
+
+/// Text fields outside a session (lock screen, PIN dialogs) need the soft
+/// keyboard even while a PC session sits underneath.
+void wizzKbOn() => gFFI.invokeMethod("enable_soft_keyboard", true);
+
+/// Give the keyboard back to the session rules when one is on screen.
+void wizzKbRestore() {
+  final m = WizzSessions.to;
+  if (m.hostMounted && !m.minimized.value) {
+    gFFI.invokeMethod("enable_soft_keyboard", false);
   }
 }
 
@@ -1674,6 +1689,7 @@ import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:get/get.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:settings_ui/settings_ui.dart';
 
 import '../../common.dart';
@@ -1681,7 +1697,7 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import 'remote_page.dart' show sendPrompt;
 import 'scan_page.dart';
-import 'wizz_switcher.dart' show wizzScreenshot;
+import 'wizz_switcher.dart' show wizzScreenshot, wizzKbOn, wizzKbRestore;
 
 // ------------------------------------------------------------------ prefs
 class WizzPrefs {
@@ -2126,7 +2142,14 @@ class _WizzLockPageState extends State<WizzLockPage> {
   @override
   void initState() {
     super.initState();
+    wizzKbOn();
     WidgetsBinding.instance.addPostFrameCallback((_) => _fingerprint());
+  }
+
+  @override
+  void dispose() {
+    wizzKbRestore();
+    super.dispose();
   }
 
   Future<void> _fingerprint() async {
@@ -2200,6 +2223,7 @@ Future<bool> _wizzVerify(BuildContext context) async {
 Future<String?> _wizzAskNewPin(BuildContext context) async {
   final a = TextEditingController(), b = TextEditingController();
   String err = '';
+  wizzKbOn();
   return showDialog<String>(
     context: context,
     builder: (ctx) => StatefulBuilder(
@@ -2293,6 +2317,12 @@ SettingsSection wizzSettingsSection(BuildContext context, void Function() refres
       value: const Text('Export or import as QR code or text'),
       leading: const Icon(Icons.qr_code_2),
       onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzServerConfigPage())),
+    ),
+    SettingsTile(
+      title: const Text('Back up & restore'),
+      value: const Text('All Multiview and server settings in one file'),
+      leading: const Icon(Icons.settings_backup_restore),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzBackupPage())),
     ),
     SettingsTile(
       title: const Text('Keyboard'),
@@ -3638,6 +3668,260 @@ class _WizzProfilesPageState extends State<WizzProfilesPage> {
 }
 
 // -------------------------------------------------- share server settings
+// ------------------------------------------------------------ backup / restore
+/// Wizz settings that travel in a backup. App lock and its PIN never do.
+const kWizzBackupLocal = [
+  'bar-pos', 'bar-see', 'bar-shrink', 'bar-hide', 'auto-delete',
+  'save-ask', 'save-folder', 'save-tree', 'save-tree-name',
+  'keys-see', 'fav-keys',
+  'tb-order', 'tb-hidden', 'tb-color', 'tb-float', 'tb-see',
+  'home-pcs', 'home-chat', 'home-share', 'swipe-switch',
+  'mouse-speed', 'mouse-accel', 'kb-default', 'kb-nopred-alt',
+  'own-tag', 'skin', 'skins', 'profiles', 'privacy-mode', 'lock-after',
+];
+/// RustDesk's own phone-side options worth carrying over.
+const kWizzBackupRdLocal = ['theme', 'lang'];
+
+bool _wizzBackupSkip(String k) {
+  final l = k.toLowerCase();
+  if (l == 'key') return false; // the server's public key
+  return l.contains('password') || l.contains('token') || l.contains('secret') ||
+      l.contains('trusted') || l.contains('salt') || l.contains('key-pair');
+}
+
+Future<Map<String, dynamic>> wizzBackupBuild() async {
+  final main = <String, String>{};
+  try {
+    final m = jsonDecode(await bind.mainGetOptions()) as Map<String, dynamic>;
+    m.forEach((k, v) {
+      if (!_wizzBackupSkip(k) && v is String && v.isNotEmpty) main[k] = v;
+    });
+  } catch (_) {}
+  final local = <String, String>{};
+  for (final k in kWizzBackupLocal) {
+    final v = bind.mainGetLocalOption(key: 'wizz-$k');
+    if (v.isNotEmpty) local['wizz-$k'] = v;
+  }
+  for (final k in kWizzBackupRdLocal) {
+    final v = bind.mainGetLocalOption(key: k);
+    if (v.isNotEmpty) local[k] = v;
+  }
+  List<String> fav = [];
+  try {
+    fav = (await bind.mainGetFav()).toList();
+  } catch (_) {}
+  return {
+    'app': 'rustdesk-multiview',
+    'v': 1,
+    'created': DateTime.now().toIso8601String(),
+    'main': main,
+    'local': local,
+    'fav': fav,
+  };
+}
+
+String wizzBackupText(Map<String, dynamic> b) =>
+    'wizzbackup:${base64Url.encode(gzip.encode(utf8.encode(jsonEncode(b))))}';
+
+Map<String, dynamic>? wizzBackupParse(String raw) {
+  var t = raw.trim();
+  try {
+    if (t.startsWith('wizzbackup:')) {
+      t = utf8.decode(gzip.decode(base64Url.decode(t.substring(11).trim())));
+    }
+    final m = jsonDecode(t);
+    if (m is Map<String, dynamic> && m['app'] == 'rustdesk-multiview') return m;
+  } catch (_) {}
+  return null;
+}
+
+String _wizzBackupSummary(Map<String, dynamic> b) {
+  final main = Map<String, dynamic>.from(b['main'] ?? {});
+  final local = Map<String, dynamic>.from(b['local'] ?? {});
+  int profiles = 0, skins = 0;
+  try {
+    profiles = (jsonDecode(local['wizz-profiles'] ?? '[]') as List).length;
+  } catch (_) {}
+  try {
+    skins = (jsonDecode(local['wizz-skins'] ?? '[]') as List).length;
+  } catch (_) {}
+  final fav = (b['fav'] as List?)?.length ?? 0;
+  final id = main['custom-rendezvous-server'] ?? '';
+  final created = (b['created'] ?? '').toString();
+  return [
+    if (created.length >= 16) 'Made: ${created.substring(0, 16).replaceFirst('T', ' ')}',
+    'ID server: ${id.isEmpty ? 'RustDesk public' : id}',
+    if ((main['relay-server'] ?? '').isNotEmpty) 'Relay: ${main['relay-server']}',
+    if ((main['api-server'] ?? '').isNotEmpty) 'API: ${main['api-server']}',
+    'Server profiles: $profiles',
+    'Saved skins: $skins',
+    'Favourite PCs: $fav',
+    '${local.length + main.length} settings in total',
+  ].join('\n');
+}
+
+Future<void> wizzBackupApply(Map<String, dynamic> b) async {
+  final main = Map<String, dynamic>.from(b['main'] ?? {});
+  for (final e in main.entries) {
+    if (_wizzBackupSkip(e.key) || e.value is! String) continue;
+    await bind.mainSetOption(key: e.key, value: e.value as String);
+  }
+  final local = Map<String, dynamic>.from(b['local'] ?? {});
+  for (final e in local.entries) {
+    final k = e.key;
+    final ok = (k.startsWith('wizz-') && kWizzBackupLocal.contains(k.substring(5))) ||
+        kWizzBackupRdLocal.contains(k);
+    if (ok && e.value is String) {
+      await bind.mainSetLocalOption(key: k, value: e.value as String);
+    }
+  }
+  final fav = (b['fav'] as List?)?.map((e) => e.toString()).toList();
+  if (fav != null && fav.isNotEmpty) {
+    try {
+      final cur = (await bind.mainGetFav()).toList();
+      for (final id in fav) {
+        if (!cur.contains(id)) cur.add(id);
+      }
+      await bind.mainStoreFav(favs: cur);
+    } catch (_) {}
+  }
+}
+
+class WizzBackupPage extends StatefulWidget {
+  const WizzBackupPage({Key? key}) : super(key: key);
+  @override
+  State<WizzBackupPage> createState() => _WizzBackupPageState();
+}
+
+class _WizzBackupPageState extends State<WizzBackupPage> {
+  bool _busy = false;
+
+  Future<void> _saveShare() async {
+    setState(() => _busy = true);
+    try {
+      final b = await wizzBackupBuild();
+      final ts = DateTime.now()
+          .toIso8601String()
+          .substring(0, 16)
+          .replaceAll(RegExp(r'[-:]'), '')
+          .replaceFirst('T', '-');
+      final dirs = ['/storage/emulated/0/Download/RustDesk'];
+      try {
+        final d = await getExternalStorageDirectory();
+        if (d != null) dirs.add('${d.path}/Backups');
+      } catch (_) {}
+      String? path;
+      for (final dir in dirs) {
+        try {
+          await Directory(dir).create(recursive: true);
+          final f = File('$dir/multiview-settings-$ts.json');
+          await f.writeAsString(const JsonEncoder.withIndent('  ').convert(b));
+          path = f.path;
+          break;
+        } catch (_) {}
+      }
+      if (path == null) {
+        showToast('Could not save the file');
+      } else {
+        gFFI.invokeMethod('wizz_media_scan', path);
+        showToast('Saved to ${path.replaceFirst('/storage/emulated/0/', '')}');
+        gFFI.invokeMethod('wizz_share_file', path);
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _copyText() async {
+    final b = await wizzBackupBuild();
+    await Clipboard.setData(ClipboardData(text: wizzBackupText(b)));
+    showToast('Backup copied as text');
+  }
+
+  Future<void> _confirmAndApply(Map<String, dynamic>? b) async {
+    if (b == null) {
+      showToast('That is not a Multiview backup');
+      return;
+    }
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Restore these settings?'),
+        content: SingleChildScrollView(
+          child: Text('${_wizzBackupSummary(b)}\n\n'
+              'Your current settings will be replaced. Favourites are added to yours. '
+              'App lock and PIN stay as they are. The app restarts afterwards.'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Restore')),
+        ],
+      ),
+    );
+    if (go != true) return;
+    setState(() => _busy = true);
+    await wizzBackupApply(b);
+    showToast('Settings restored, restarting…');
+    await Future.delayed(const Duration(milliseconds: 600));
+    wizzRestartApp();
+  }
+
+  Future<void> _fromFile() async {
+    try {
+      final r = await FilePicker.platform.pickFiles(type: FileType.any);
+      final p = r?.files.single.path;
+      if (p == null) return;
+      await _confirmAndApply(wizzBackupParse(await File(p).readAsString()));
+    } catch (e) {
+      showToast('Could not read that file');
+    }
+  }
+
+  Future<void> _fromClipboard() async {
+    final d = await Clipboard.getData(Clipboard.kTextPlain);
+    await _confirmAndApply(wizzBackupParse(d?.text ?? ''));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget tile(IconData i, String t, String s, VoidCallback f) => ListTile(
+          leading: Icon(i),
+          title: Text(t),
+          subtitle: Text(s),
+          onTap: _busy ? null : f,
+        );
+    return Scaffold(
+      appBar: AppBar(title: const Text('Back up & restore')),
+      body: ListView(children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 16, 16, 4),
+          child: Text('Back up', style: TextStyle(fontWeight: FontWeight.bold)),
+        ),
+        tile(Icons.save_alt, 'Save & share file',
+            'ID/Relay/API server and key, server profiles, skins, toolbar, keys, keyboard, mouse, home tabs, file settings, favourites',
+            _saveShare),
+        tile(Icons.copy, 'Copy as text', 'Paste it into a note or chat to keep it', _copyText),
+        const Divider(),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Text('Restore', style: TextStyle(fontWeight: FontWeight.bold)),
+        ),
+        tile(Icons.file_open_outlined, 'From a file', 'Pick a multiview-settings .json', _fromFile),
+        tile(Icons.content_paste, 'From copied text', 'Uses the backup text on your clipboard', _fromClipboard),
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text(
+            'Not included: app lock and PIN, passwords, login tokens. '
+            'The backup does contain your server addresses and key, so keep it private.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+        ),
+        if (_busy) const LinearProgressIndicator(),
+      ]),
+    );
+  }
+}
+
 class WizzServerConfigPage extends StatefulWidget {
   const WizzServerConfigPage({Key? key}) : super(key: key);
   @override
@@ -3880,8 +4164,8 @@ class _WizzKeyboardSettingsPageState extends State<WizzKeyboardSettingsPage> {
         const Divider(),
         SwitchListTile(
           title: const Text('Alternative no-predictions method'),
-          subtitle: const Text('Turn on only if "No predictions" shows a locked/secure keyboard. '
-              'Some keyboards then type English letters only.'),
+          subtitle: const Text('Password-type field without the incognito sign. '
+              'Some keyboards then limit languages or layouts.'),
           value: WizzPrefs.kbNoPredAlt,
           onChanged: (v) => setState(() => WizzPrefs.kbNoPredAlt = v),
         ),
@@ -6396,7 +6680,10 @@ s = rep(s, """                      textInputAction: TextInputAction.newline,
                       autocorrect: false,""", """                      textInputAction: TextInputAction.newline,
                       autocorrect: false,
                       enableSuggestions: _wizzKbMode != 'nopred',
-                      enableIMEPersonalizedLearning: _wizzKbMode != 'nopred',""")
+                      // SwiftKey/Gboard show incognito for this flag; the
+                      // alternative (password-type field) doesn't learn anyway.
+                      enableIMEPersonalizedLearning:
+                          _wizzKbMode != 'nopred' || WizzPrefs.kbNoPredAlt,""")
 s = rep(s, """                      // trick way to make backspace work always
                       keyboardType: TextInputType.multiline,""", """                      // trick way to make backspace work always
                       keyboardType: _wizzKbMode == 'nopred' && WizzPrefs.kbNoPredAlt
