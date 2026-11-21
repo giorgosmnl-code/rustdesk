@@ -690,6 +690,7 @@ WIZZ_SWITCHER_DART = r'''// Wizz: hold the sessions button to see every open PC 
 // go first and tap one. Optional: swipe the bottom toolbar to change PC.
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:path_provider/path_provider.dart';
@@ -1490,7 +1491,7 @@ Future<void> wizzScreenshot(FFI ffi) async {
   try {
     copy = img.clone();
     wizzFlash.value++;
-    HapticFeedback.lightImpact();
+    HapticFeedback.mediumImpact();
     final bd = await copy.toByteData(format: ui.ImageByteFormat.png);
     if (bd == null) throw 'encode';
     String title = 'PC';
@@ -1525,8 +1526,9 @@ Future<void> wizzScreenshot(FFI ffi) async {
       'text': '${saved.path.replaceFirst('/storage/emulated/0/', '')} · tap to open',
       'progress': 100,
       'path': saved.path,
+      'share': true,
     });
-    wizzToast('Screenshot saved');
+    _wizzShotCard(bd.buffer.asUint8List(), saved.path);
   } catch (_) {
     wizzToast('Could not save the screenshot');
   } finally {
@@ -1546,8 +1548,8 @@ class _WizzFlashState extends State<WizzFlash> {
 
   void _on() {
     if (!mounted) return;
-    setState(() => _o = 0.6);
-    Future.delayed(const Duration(milliseconds: 90), () {
+    setState(() => _o = 0.8);
+    Future.delayed(const Duration(milliseconds: 180), () {
       if (mounted) setState(() => _o = 0);
     });
   }
@@ -1570,12 +1572,93 @@ class _WizzFlashState extends State<WizzFlash> {
       child: IgnorePointer(
         child: AnimatedOpacity(
           opacity: _o,
-          duration: const Duration(milliseconds: 120),
+          duration: const Duration(milliseconds: 220),
           child: Container(color: Colors.white),
         ),
       ),
     );
   }
+}
+
+
+// After a screenshot: a small preview card with Share / Open / Copy.
+OverlayEntry? _wizzShotEntry;
+Timer? _wizzShotTimer;
+
+void _wizzShotCard(Uint8List png, String path) {
+  _wizzShotTimer?.cancel();
+  _wizzShotEntry?.remove();
+  _wizzShotEntry = null;
+  final ov = globalKey.currentState?.overlay;
+  if (ov == null) return;
+  late OverlayEntry e;
+  void close() {
+    _wizzShotTimer?.cancel();
+    if (identical(_wizzShotEntry, e)) {
+      e.remove();
+      _wizzShotEntry = null;
+    }
+  }
+
+  Widget btn(IconData icon, String label, void Function() onTap) => InkWell(
+        onTap: () {
+          onTap();
+          close();
+        },
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, color: Colors.white, size: 20),
+            const SizedBox(height: 2),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 11)),
+          ]),
+        ),
+      );
+
+  e = OverlayEntry(
+    builder: (ctx) => Positioned(
+      right: 12,
+      top: MediaQuery.of(ctx).padding.top + 60,
+      child: Dismissible(
+        key: UniqueKey(),
+        direction: DismissDirection.horizontal,
+        onDismissed: (_) => close(),
+        child: Material(
+          color: const Color(0xEE202124),
+          elevation: 6,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              GestureDetector(
+                onTap: () {
+                  gFFI.invokeMethod('wizz_open_file', path);
+                  close();
+                },
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Image.memory(png, width: 170, cacheWidth: 340, fit: BoxFit.contain),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                btn(Icons.share, 'Share', () => gFFI.invokeMethod('wizz_share_file', path)),
+                btn(Icons.open_in_new, 'Open', () => gFFI.invokeMethod('wizz_open_file', path)),
+                btn(Icons.copy, 'Copy', () {
+                  gFFI.invokeMethod('wizz_copy_image', path);
+                  wizzToast('Screenshot copied');
+                }),
+              ]),
+            ]),
+          ),
+        ),
+      ),
+    ),
+  );
+  _wizzShotEntry = e;
+  ov.insert(e);
+  _wizzShotTimer = Timer(const Duration(seconds: 5), close);
 }
 '''
 
@@ -6419,6 +6502,65 @@ s = rep(s, '                "wizz_speech" -> {\n', """                "wizz_medi
                     result.success(true)
                 }
                 "wizz_speech" -> {
+""")
+save(p, s)
+
+# ===== Wizz: screenshot preview card with Share / Open / Copy, notification actions =====
+p = kt + 'WizzFiles.kt'
+s = load(p)
+s = rep(s, "    fun notifyDownload(ctx: Context, call: MethodCall) {\n", """    fun shareIntent(ctx: Context, path: String): Intent {
+        val f = File(path)
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.wizzfiles", f)
+        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+        val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        send.clipData = android.content.ClipData.newRawUri("", uri)
+        return Intent.createChooser(send, f.name)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    fun copyImage(ctx: Context, path: String) {
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.wizzfiles", File(path))
+        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newUri(ctx.contentResolver, "Screenshot", uri))
+    }
+
+    fun notifyDownload(ctx: Context, call: MethodCall) {
+""")
+s = rep(s, "            b.setContentIntent(PendingIntent.getActivity(ctx, call.argument<Int>(\"nid\") ?: 7302, target, flags))\n",
+        """            b.setContentIntent(PendingIntent.getActivity(ctx, call.argument<Int>("nid") ?: 7302, target, flags))
+            if (call.argument<Boolean>("share") == true && path.isNotEmpty()) {
+                try {
+                    val nid = call.argument<Int>("nid") ?: 7302
+                    @Suppress("DEPRECATION")
+                    b.addAction(0, "Open", PendingIntent.getActivity(ctx, nid + 1, target, flags))
+                    @Suppress("DEPRECATION")
+                    b.addAction(0, "Share", PendingIntent.getActivity(ctx, nid + 2, shareIntent(ctx, path), flags))
+                } catch (e: Exception) {
+                    Log.e("Wizz", "notification actions: $e")
+                }
+            }
+""")
+save(p, s)
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, '                "wizz_media_scan" -> {\n', """                "wizz_share_file" -> {
+                    try {
+                        startActivity(WizzFiles.shareIntent(this, call.arguments as String))
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "share: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_copy_image" -> {
+                    try {
+                        WizzFiles.copyImage(this, call.arguments as String)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "copy image: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_media_scan" -> {
 """)
 save(p, s)
 
