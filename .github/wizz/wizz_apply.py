@@ -851,12 +851,26 @@ class _WizzStripState extends State<_WizzStrip> {
                 current: i == cur,
                 hover: i == _hover,
                 onTap: () => _pick(i),
+                onClose: () {
+                  if (WizzSessions.to.sessions.length <= 1) widget.onClose();
+                  WizzSessions.to.closeAt(i);
+                },
               ),
             _WizzAddCard(
                 key: _cards[list.length],
                 width: cardW * 0.5,
                 hover: _hover == list.length,
                 onTap: () => _pick(list.length)),
+            _WizzAddCard(
+                width: cardW * 0.5,
+                hover: false,
+                icon: Icons.clear_all,
+                color: Colors.redAccent,
+                label: 'Disconnect all',
+                onTap: () {
+                  widget.onClose();
+                  wizzConfirmDisconnectAll();
+                }),
           ];
           if (wide) {
             return ConstrainedBox(
@@ -912,13 +926,15 @@ class _WizzCard extends StatelessWidget {
   final bool current;
   final bool hover;
   final void Function() onTap;
+  final void Function() onClose;
   const _WizzCard(
       {Key? key,
       required this.s,
       required this.width,
       required this.current,
       required this.hover,
-      required this.onTap})
+      required this.onTap,
+      required this.onClose})
       : super(key: key);
 
   @override
@@ -962,6 +978,20 @@ class _WizzCard extends StatelessWidget {
                         alignment: Alignment.center,
                         child: const Icon(Icons.link_off, color: Colors.red, size: 28),
                       ),
+                    Positioned(
+                      left: 0,
+                      top: 0,
+                      child: GestureDetector(
+                        onTap: onClose,
+                        child: Container(
+                          margin: const EdgeInsets.all(3),
+                          padding: const EdgeInsets.all(3),
+                          decoration: const BoxDecoration(
+                              color: Color(0xAA000000), shape: BoxShape.circle),
+                          child: const Icon(Icons.close, size: 14, color: Colors.white),
+                        ),
+                      ),
+                    ),
                     if (privacy)
                       const Positioned(
                         right: 4,
@@ -992,8 +1022,17 @@ class _WizzAddCard extends StatelessWidget {
   final double width;
   final bool hover;
   final void Function() onTap;
+  final IconData icon;
+  final Color color;
+  final String? label;
   const _WizzAddCard(
-      {Key? key, required this.width, required this.hover, required this.onTap})
+      {Key? key,
+      required this.width,
+      required this.hover,
+      required this.onTap,
+      this.icon = Icons.add,
+      this.color = Colors.white,
+      this.label})
       : super(key: key);
 
   @override
@@ -1008,7 +1047,16 @@ class _WizzAddCard extends StatelessWidget {
           borderRadius: BorderRadius.circular(10),
           border: Border.all(color: hover ? Colors.white : Colors.white24, width: hover ? 2.5 : 1),
         ),
-        child: const Icon(Icons.add, color: Colors.white, size: 30),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(icon, color: color, size: 30),
+          if (label != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(label!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: color, fontSize: 11)),
+            ),
+        ]),
       ),
     );
   }
@@ -1028,7 +1076,7 @@ Widget wizzSwipeSwitch(Widget toolbar) {
       final i = (m.current.value + (v < 0 ? 1 : -1) + n) % n;
       HapticFeedback.selectionClick();
       m.switchTo(i);
-      showToast(m.sessions[i].title);
+      wizzToast(m.sessions[i].title);
     },
     child: toolbar,
   );
@@ -1181,7 +1229,13 @@ List<Widget> wizzArrange(
   }
   visible.addAll(byId.values);
   visible.addAll(other);
-  visible.add(IconButton(
+  final frost = WizzPrefs.tbFloat && wizzFrosted(WizzPrefs.tbSeeThrough);
+  if (frost) {
+    for (var i = 0; i < visible.length; i++) {
+      visible[i] = _wizzFrost(visible[i]);
+    }
+  }
+  final moreBtn = IconButton(
     color: Colors.white,
     icon: const Icon(Icons.more_vert),
     onPressed: () {
@@ -1191,8 +1245,81 @@ List<Widget> wizzArrange(
         _wizzMoreSheet(context, hidden, onMore);
       }
     },
-  ));
+  );
+  visible.add(frost ? _wizzFrost(moreBtn) : moreBtn);
   return visible;
+}
+
+Widget _wizzFrost(Widget w) => Container(
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      decoration: const BoxDecoration(color: kWizzFrost, shape: BoxShape.circle),
+      child: w,
+    );
+
+// ---------------------------------------------------- one toast at a time
+OverlayEntry? _wizzToastEntry;
+Timer? _wizzToastTimer;
+
+/// Like showToast, but a new one replaces the previous one instead of stacking.
+void wizzToast(String text) {
+  _wizzToastTimer?.cancel();
+  _wizzToastEntry?.remove();
+  _wizzToastEntry = null;
+  final ov = globalKey.currentState?.overlay;
+  if (ov == null) return;
+  final e = OverlayEntry(
+    builder: (ctx) => IgnorePointer(
+      child: Align(
+        alignment: const Alignment(0, 0.75),
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
+            decoration: BoxDecoration(
+                color: const Color(0xDD202020), borderRadius: BorderRadius.circular(20)),
+            child: Text(text,
+                style: const TextStyle(color: Colors.white, fontSize: 16)),
+          ),
+        ),
+      ),
+    ),
+  );
+  _wizzToastEntry = e;
+  ov.insert(e);
+  _wizzToastTimer = Timer(const Duration(milliseconds: 1500), () {
+    if (identical(_wizzToastEntry, e)) {
+      e.remove();
+      _wizzToastEntry = null;
+    }
+  });
+}
+
+// --------------------------------------------- disconnecting from home
+bool wizzIsOpen(String id) => WizzSessions.to.sessions.any((s) => s.id == id);
+
+void wizzDisconnectId(String id) {
+  final m = WizzSessions.to;
+  final i = m.sessions.indexWhere((s) => s.id == id);
+  if (i >= 0) m.closeAt(i);
+}
+
+Future<void> wizzConfirmDisconnectAll([BuildContext? context]) async {
+  final ctx = context ?? globalKey.currentContext;
+  final n = WizzSessions.to.sessions.length;
+  if (ctx == null || n == 0) return;
+  final ok = await showDialog<bool>(
+    context: ctx,
+    builder: (c) => AlertDialog(
+      title: Text(n == 1 ? 'Disconnect this PC?' : 'Disconnect all $n PCs?'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+        TextButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('Disconnect', style: TextStyle(color: Colors.red))),
+      ],
+    ),
+  );
+  if (ok == true && WizzSessions.to.hostMounted) wizzPopToHome();
 }
 
 void _wizzMoreSheet(BuildContext context, List<MapEntry<String, Widget>> hidden,
@@ -1279,10 +1406,10 @@ Widget wizzPeerTile(String id, double size, Widget fallback) {
   return Obx(() {
     final m = WizzSessions.to;
     final i = m.sessions.indexWhere((s) => s.id == id);
-    if (i < 0) return fallback;
+    if (i < 0) return _wizzBadged(id, fallback);
     final s = m.sessions[i];
     final dropped = s.dropped.value;
-    return Container(
+    return _wizzBadged(id, Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
@@ -1316,8 +1443,29 @@ Widget wizzPeerTile(String id, double size, Widget fallback) {
             ),
         ]),
       ),
-    );
+    ));
   });
+}
+
+/// PCs reached through another server get a small badge (globe = RustDesk public).
+Widget _wizzBadged(String id, Widget tile) {
+  final b = wizzServerBadge(id);
+  if (b == null) return tile;
+  return Stack(clipBehavior: Clip.none, children: [
+    tile,
+    Positioned(
+      right: -3,
+      bottom: -3,
+      child: Container(
+        padding: const EdgeInsets.all(2),
+        decoration: BoxDecoration(
+            color: b.$2,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 1.5)),
+        child: Icon(b.$1, size: 12, color: Colors.white),
+      ),
+    ),
+  ]);
 }
 '''
 
@@ -1329,6 +1477,8 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:get/get.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:settings_ui/settings_ui.dart';
@@ -1337,6 +1487,7 @@ import '../../common.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import 'remote_page.dart' show sendPrompt;
+import 'scan_page.dart';
 
 // ------------------------------------------------------------------ prefs
 class WizzPrefs {
@@ -1355,6 +1506,8 @@ class WizzPrefs {
   static set barSeeThrough(int v) => _set('bar-see', '$v');
   static bool get barBottom => _get('bar-pos', 'top') == 'bottom';
   static set barBottom(bool v) => _set('bar-pos', v ? 'bottom' : 'top');
+  static int get barShrink => _int('bar-shrink', 10);
+  static set barShrink(int v) => _set('bar-shrink', '$v');
   static int get autoHide => _int('bar-hide', 0);
   static set autoHide(int v) => _set('bar-hide', '$v');
   static String get saveFolder => _get('save-folder', 'dl_rd');
@@ -1382,7 +1535,7 @@ class WizzPrefs {
   static List<String> get tbHidden =>
       _get('tb-hidden', '').split(',')..removeWhere((e) => e.isEmpty);
   static set tbHidden(List<String> v) => _set('tb-hidden', v.join(','));
-  static String get tbColor => _get('tb-color', 'blue');
+  static String get tbColor => _get('tb-color', 'skin');
   static set tbColor(String v) => _set('tb-color', v);
   static bool get tbFloat => _get('tb-float', 'N') == 'Y';
   static set tbFloat(bool v) => _set('tb-float', v ? 'Y' : 'N');
@@ -1396,6 +1549,21 @@ class WizzPrefs {
   static set homeChat(bool v) => _set('home-chat', v ? 'Y' : 'N');
   static bool get homeShare => _get('home-share', 'Y') == 'Y';
   static set homeShare(bool v) => _set('home-share', v ? 'Y' : 'N');
+
+  // mouse mode: cursor speed and acceleration (cached: read on every move)
+  static double? _mouseSpeed;
+  static int? _mouseAccel;
+  static double get mouseSpeed =>
+      _mouseSpeed ??= (double.tryParse(_get('mouse-speed', '1.0')) ?? 1.0).clamp(0.5, 3.0);
+  static set mouseSpeed(double v) {
+    _mouseSpeed = double.parse(v.clamp(0.5, 3.0).toStringAsFixed(1));
+    _set('mouse-speed', _mouseSpeed!.toStringAsFixed(1));
+  }
+  static int get mouseAccel => _mouseAccel ??= _int('mouse-accel', 0).clamp(0, 3);
+  static set mouseAccel(int v) {
+    _mouseAccel = v.clamp(0, 3);
+    _set('mouse-accel', '$_mouseAccel');
+  }
 
   // switching PCs
   static bool get swipeSwitch => _get('swipe-switch', 'N') == 'Y';
@@ -1422,14 +1590,16 @@ String wizzPinHash(String pin) =>
     sha256.convert(utf8.encode('wizz-multiview:$pin')).toString();
 
 /// Labels that stay readable on any background (used with see-through bars).
-const List<Shadow> kWizzTextOutline = [
-  Shadow(blurRadius: 2, color: Colors.black),
-  Shadow(offset: Offset(1, 1), blurRadius: 1, color: Colors.black),
-  Shadow(offset: Offset(-1, -1), blurRadius: 1, color: Colors.black),
-];
+/// Shadows were hard on the eyes; see-through bars use frosted backdrops instead.
+const List<Shadow> kWizzTextOutline = [];
 
-Color wizzBarColor(int seeThroughPercent) =>
-    Colors.black.withOpacity((100 - seeThroughPercent.clamp(0, 100)) / 100.0);
+Color wizzBarColor(int seeThroughPercent, {Color? base}) =>
+    (base ?? Colors.black)
+        .withOpacity((100 - seeThroughPercent.clamp(0, 100)) / 100.0);
+
+/// Very see-through bars get soft dark backdrops behind icons and labels.
+bool wizzFrosted(int seeThroughPercent) => seeThroughPercent >= 40;
+const Color kWizzFrost = Color(0x59000000);
 
 // -------------------------------------------------------- session toolbar
 const Map<String, String> kWizzTbLabels = {
@@ -1466,7 +1636,10 @@ final Map<String, Color> kWizzTbColors = {
 };
 
 Color wizzToolbarColor({bool opaque = false}) {
-  final c = kWizzTbColors[WizzPrefs.tbColor] ?? MyTheme.accent;
+  final key = WizzPrefs.tbColor;
+  final c = key.startsWith('#')
+      ? (wizzParseColor(key) ?? WizzSkin.current.toolbar)
+      : (kWizzTbColors[key] ?? WizzSkin.current.toolbar);
   if (opaque || !WizzPrefs.tbFloat) return c;
   return c.withOpacity((100 - WizzPrefs.tbSeeThrough.clamp(0, 100)) / 100.0);
 }
@@ -1891,6 +2064,36 @@ SettingsSection wizzSettingsSection(BuildContext context, void Function() refres
       onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzKeysSettingsPage())),
     ),
     SettingsTile(
+      title: const Text('Skin'),
+      value: Text(WizzSkin.current.name),
+      leading: const Icon(Icons.palette_outlined),
+      onPressed: (c) async {
+        await Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzSkinEditorPage()));
+        refresh();
+      },
+    ),
+    SettingsTile(
+      title: const Text('Server profiles'),
+      value: const Text('RustDesk public and other servers'),
+      leading: const Icon(Icons.dns_outlined),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzProfilesPage())),
+    ),
+    SettingsTile(
+      title: const Text('Share server settings'),
+      value: const Text('Export or import as QR code or text'),
+      leading: const Icon(Icons.qr_code_2),
+      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzServerConfigPage())),
+    ),
+    SettingsTile(
+      title: const Text('Mouse'),
+      value: Text('Speed ${WizzPrefs.mouseSpeed.toStringAsFixed(1)}× · acceleration ${kWizzAccelNames[WizzPrefs.mouseAccel]}'),
+      leading: const Icon(Icons.mouse_outlined),
+      onPressed: (c) async {
+        await Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzMouseSettingsPage()));
+        refresh();
+      },
+    ),
+    SettingsTile(
       title: const Text('Session toolbar'),
       value: const Text('Buttons, colour, transparency'),
       leading: const Icon(Icons.view_week_outlined),
@@ -2101,6 +2304,14 @@ class _WizzFilesSettingsPageState extends State<WizzFilesSettingsPage> {
           value: WizzPrefs.barBottom,
           onChanged: (v) => setState(() => WizzPrefs.barBottom = v),
         ),
+        const ListTile(title: Text('Shrink the bar to a small pill after'), dense: true),
+        for (final e in const {0: 'Never', 5: '5 seconds', 10: '10 seconds', 30: '30 seconds'}.entries)
+          RadioListTile<int>(
+            title: Text(e.value),
+            value: e.key,
+            groupValue: WizzPrefs.barShrink,
+            onChanged: (v) => setState(() => WizzPrefs.barShrink = v ?? 0),
+          ),
         const ListTile(title: Text('Hide the bar when a download is done'), dense: true),
         for (final e in hides.entries)
           RadioListTile<int>(
@@ -2228,10 +2439,48 @@ class _WizzToolbarSettingsPageState extends State<WizzToolbarSettingsPage> {
           ],
         ),
         const Divider(),
-        const ListTile(title: Text('Colour'), dense: true),
+        const ListTile(
+            title: Text('Colour'),
+            subtitle: Text('Palette = follow the skin · rainbow = pick any colour'),
+            dense: true),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Wrap(spacing: 12, runSpacing: 12, children: [
+            GestureDetector(
+              onTap: () => setState(() => WizzPrefs.tbColor = 'skin'),
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: WizzSkin.current.toolbar,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                      color: WizzPrefs.tbColor == 'skin' ? Colors.white : Colors.white24,
+                      width: WizzPrefs.tbColor == 'skin' ? 3 : 1),
+                ),
+                child: const Icon(Icons.palette, color: Colors.white, size: 18),
+              ),
+            ),
+            GestureDetector(
+              onTap: () async {
+                final c = await wizzPickColor(context, wizzToolbarColor(opaque: true), 'Toolbar colour');
+                if (c != null) setState(() => WizzPrefs.tbColor = wizzColorHex(c));
+              },
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  gradient: const SweepGradient(colors: [
+                    Colors.red, Colors.yellow, Colors.green, Colors.cyan, Colors.blue, Colors.purple, Colors.red
+                  ]),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                      color: WizzPrefs.tbColor.startsWith('#') ? Colors.white : Colors.white24,
+                      width: WizzPrefs.tbColor.startsWith('#') ? 3 : 1),
+                ),
+                child: const Icon(Icons.colorize, color: Colors.white, size: 18),
+              ),
+            ),
             for (final e in kWizzTbColors.entries)
               GestureDetector(
                 onTap: () => setState(() => WizzPrefs.tbColor = e.key),
@@ -2268,7 +2517,7 @@ class _WizzToolbarSettingsPageState extends State<WizzToolbarSettingsPage> {
                   _hidden = [];
                   WizzPrefs.tbOrder = _order;
                   WizzPrefs.tbHidden = _hidden;
-                  WizzPrefs.tbColor = 'blue';
+                  WizzPrefs.tbColor = 'skin';
                   WizzPrefs.tbFloat = false;
                 }),
             child: const Text('Reset to default')),
@@ -2332,6 +2581,973 @@ class _WizzHomeTabsSettingsPageState extends State<WizzHomeTabsSettingsPage> {
     );
   }
 }
+
+// ------------------------------------------------------------- colours
+Color? wizzParseColor(String? s) {
+  if (s == null) return null;
+  var h = s.trim().replaceFirst('#', '');
+  if (h.length == 6) h = 'FF$h';
+  if (h.length != 8) return null;
+  final v = int.tryParse(h, radix: 16);
+  return v == null ? null : Color(v);
+}
+
+String wizzColorHex(Color c) =>
+    '#${c.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase()}';
+
+/// A small colour picker: hue / saturation / brightness sliders, HEX field
+/// and a row of quick swatches.
+Future<Color?> wizzPickColor(BuildContext context, Color initial, String title) {
+  var hsv = HSVColor.fromColor(initial);
+  final hex = TextEditingController(text: wizzColorHex(initial));
+  const swatches = [
+    Color(0xFF0071FF), Color(0xFFEF443B), Color(0xFFC62828), Color(0xFFEF6C00),
+    Color(0xFFF9A825), Color(0xFF2E7D32), Color(0xFF00796B), Color(0xFF00B6F0),
+    Color(0xFF6A1B9A), Color(0xFFAD1457), Color(0xFF424242), Color(0xFF000000),
+  ];
+  return showDialog<Color>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(builder: (ctx, setState) {
+      final c = hsv.toColor();
+      void setHsv(HSVColor v) => setState(() {
+            hsv = v;
+            hex.text = wizzColorHex(v.toColor());
+          });
+      Widget slider(String label, double value, double max, List<Color> track,
+              void Function(double) on) =>
+          Row(children: [
+            SizedBox(width: 72, child: Text(label)),
+            Expanded(
+              child: Container(
+                height: 28,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(colors: track),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: SliderTheme(
+                  data: SliderTheme.of(ctx).copyWith(
+                    trackHeight: 0,
+                    activeTrackColor: Colors.transparent,
+                    inactiveTrackColor: Colors.transparent,
+                    thumbColor: Colors.white,
+                  ),
+                  child: Slider(value: value, min: 0, max: max, onChanged: on),
+                ),
+              ),
+            ),
+          ]);
+      return AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 300,
+          child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              height: 48,
+              decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(8)),
+            ),
+            const SizedBox(height: 12),
+            slider('Colour', hsv.hue, 360, [
+              for (var h = 0; h <= 360; h += 60) HSVColor.fromAHSV(1, h.toDouble(), 1, 1).toColor()
+            ], (v) => setHsv(hsv.withHue(v))),
+            const SizedBox(height: 8),
+            slider('Strength', hsv.saturation, 1, [
+              hsv.withSaturation(0).toColor(), hsv.withSaturation(1).toColor()
+            ], (v) => setHsv(hsv.withSaturation(v))),
+            const SizedBox(height: 8),
+            slider('Brightness', hsv.value, 1, [
+              Colors.black, hsv.withValue(1).toColor()
+            ], (v) => setHsv(hsv.withValue(v))),
+            const SizedBox(height: 8),
+            TextField(
+              controller: hex,
+              decoration: const InputDecoration(labelText: 'HEX (#RRGGBB)'),
+              onSubmitted: (t) {
+                final p = wizzParseColor(t);
+                if (p != null) setState(() => hsv = HSVColor.fromColor(p));
+              },
+            ),
+            const SizedBox(height: 12),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              for (final sw in swatches)
+                GestureDetector(
+                  onTap: () => setHsv(HSVColor.fromColor(sw)),
+                  child: Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                        color: sw,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white54)),
+                  ),
+                ),
+            ]),
+          ]),
+        )),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () {
+                final p = wizzParseColor(hex.text);
+                Navigator.pop(ctx, p ?? hsv.toColor());
+              },
+              child: const Text('OK')),
+        ],
+      );
+    }),
+  );
+}
+
+// ---------------------------------------------------------------- skins
+class WizzSkin {
+  String name;
+  Color accent;
+  Color toolbar;
+  Color download;
+  Color keys;
+  Color? background; // dark theme background (null = default)
+  Color? card; // dark theme cards (null = default)
+
+  WizzSkin(this.name, this.accent, this.toolbar, this.download, this.keys,
+      {this.background, this.card});
+
+  WizzSkin copy() => WizzSkin(name, accent, toolbar, download, keys,
+      background: background, card: card);
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'accent': wizzColorHex(accent),
+        'toolbar': wizzColorHex(toolbar),
+        'download': wizzColorHex(download),
+        'keys': wizzColorHex(keys),
+        if (background != null) 'background': wizzColorHex(background!),
+        if (card != null) 'card': wizzColorHex(card!),
+      };
+
+  static WizzSkin? fromJson(dynamic j) {
+    try {
+      final d = WizzSkin.presets.first;
+      return WizzSkin(
+        (j['name'] ?? 'Custom').toString(),
+        wizzParseColor(j['accent']) ?? d.accent,
+        wizzParseColor(j['toolbar']) ?? d.toolbar,
+        wizzParseColor(j['download']) ?? d.download,
+        wizzParseColor(j['keys']) ?? d.keys,
+        background: wizzParseColor(j['background']),
+        card: wizzParseColor(j['card']),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String export() => 'wizzskin:${base64Encode(utf8.encode(jsonEncode(toJson())))}';
+
+  static WizzSkin? import(String text) {
+    try {
+      final t = text.trim().replaceFirst('wizzskin:', '');
+      return fromJson(jsonDecode(utf8.decode(base64Decode(base64.normalize(t)))));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static final List<WizzSkin> presets = [
+    WizzSkin('RustDesk blue', const Color(0xFF0071FF), const Color(0xFF0071FF),
+        Colors.black, Colors.black),
+    WizzSkin('AnyDesk red', const Color(0xFFEF443B), const Color(0xFFEF443B),
+        const Color(0xFF2B2B2B), const Color(0xFF2B2B2B)),
+    WizzSkin('Purple', const Color(0xFF7E57C2), const Color(0xFF5E35B1),
+        Colors.black, Colors.black),
+    WizzSkin('Green', const Color(0xFF43A047), const Color(0xFF2E7D32),
+        Colors.black, Colors.black),
+    WizzSkin('Orange', const Color(0xFFFB8C00), const Color(0xFFEF6C00),
+        Colors.black, Colors.black),
+    WizzSkin('Midnight', const Color(0xFF00B6F0), const Color(0xFF1E1E24),
+        const Color(0xFF1E1E24), const Color(0xFF1E1E24),
+        background: const Color(0xFF101014), card: const Color(0xFF1C1C22)),
+  ];
+
+  static WizzSkin? _current;
+
+  static WizzSkin get current {
+    if (_current != null) return _current!;
+    try {
+      final v = bind.mainGetLocalOption(key: 'wizz-skin');
+      _current = v.isNotEmpty ? fromJson(jsonDecode(v)) : null;
+      return _current ??= presets.first.copy();
+    } catch (_) {
+      // settings not readable yet (very early start-up): don't cache
+      return presets.first.copy();
+    }
+  }
+
+  static set current(WizzSkin s) {
+    _current = s.copy();
+    bind.mainSetLocalOption(key: 'wizz-skin', value: jsonEncode(s.toJson()));
+  }
+
+  static List<WizzSkin> get saved {
+    try {
+      final v = bind.mainGetLocalOption(key: 'wizz-skins');
+      if (v.isEmpty) return [];
+      return (jsonDecode(v) as List)
+          .map(fromJson)
+          .whereType<WizzSkin>()
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static set saved(List<WizzSkin> l) => bind.mainSetLocalOption(
+      key: 'wizz-skins', value: jsonEncode(l.map((e) => e.toJson()).toList()));
+}
+
+/// Applies the skin's colours to the app theme (read once at start-up).
+ThemeData wizzSkinTheme(ThemeData t) {
+  try {
+    if (!isAndroid) return t;
+    final s = WizzSkin.current;
+    final dark = t.brightness == Brightness.dark;
+    return t.copyWith(
+      primaryColor: s.accent,
+      colorScheme: t.colorScheme.copyWith(primary: s.accent, secondary: s.accent),
+      indicatorColor: s.accent,
+      scaffoldBackgroundColor: dark ? s.background : null,
+      dialogBackgroundColor: dark ? s.background : null,
+      cardColor: dark ? s.card : null,
+      progressIndicatorTheme: ProgressIndicatorThemeData(color: s.accent),
+      floatingActionButtonTheme: t.floatingActionButtonTheme
+          .copyWith(backgroundColor: s.accent, foregroundColor: Colors.white),
+      textSelectionTheme: t.textSelectionTheme.copyWith(
+          cursorColor: s.accent,
+          selectionHandleColor: s.accent,
+          selectionColor: s.accent.withOpacity(0.35)),
+    );
+  } catch (_) {
+    return t;
+  }
+}
+
+Future<void> wizzRestartApp() async {
+  await gFFI.invokeMethodWithResult('wizz_restart');
+}
+
+class WizzSkinEditorPage extends StatefulWidget {
+  const WizzSkinEditorPage({Key? key}) : super(key: key);
+  @override
+  State<WizzSkinEditorPage> createState() => _WizzSkinEditorPageState();
+}
+
+class _WizzSkinEditorPageState extends State<WizzSkinEditorPage> {
+  late WizzSkin _skin = WizzSkin.current.copy();
+  late List<WizzSkin> _saved = WizzSkin.saved;
+  bool _changed = false;
+
+  void _set(WizzSkin s) => setState(() {
+        _skin = s.copy();
+        _changed = true;
+      });
+
+  Widget _swatch(Color? c, {double size = 32}) => Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          color: c ?? Colors.transparent,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white54),
+        ),
+        child: c == null ? const Icon(Icons.block, size: 16) : null,
+      );
+
+  Widget _colorRow(String label, String sub, Color? value, void Function(Color?) on,
+      {bool optional = false}) {
+    return ListTile(
+      title: Text(label),
+      subtitle: Text(sub),
+      trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+        if (optional && value != null)
+          IconButton(
+              tooltip: 'Use default',
+              icon: const Icon(Icons.restart_alt),
+              onPressed: () => setState(() {
+                    on(null);
+                    _changed = true;
+                  })),
+        _swatch(value),
+      ]),
+      onTap: () async {
+        final c = await wizzPickColor(context, value ?? const Color(0xFF18191E), label);
+        if (c != null) {
+          setState(() {
+            on(c);
+            _changed = true;
+          });
+        }
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = _skin;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Skin')),
+      body: ListView(children: [
+        // preview
+        Container(
+          margin: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: s.background ?? const Color(0xFF18191E),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white24),
+          ),
+          child: Column(children: [
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+              decoration: BoxDecoration(
+                  color: s.keys, borderRadius: const BorderRadius.vertical(top: Radius.circular(12))),
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                for (final k in ['Ctrl+C', 'Ctrl+V', 'Esc', 'Enter'])
+                  Text(k, style: const TextStyle(color: Colors.white, fontSize: 12)),
+              ]),
+            ),
+            Container(
+              margin: const EdgeInsets.all(10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: s.download, borderRadius: BorderRadius.circular(8)),
+              child: Row(children: [
+                const Icon(Icons.file_copy, color: Colors.white, size: 16),
+                const SizedBox(width: 8),
+                const Expanded(
+                    child: Text('Downloading 42%', style: TextStyle(color: Colors.white))),
+                Text('Cancel', style: TextStyle(color: s.accent, fontWeight: FontWeight.bold)),
+              ]),
+            ),
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                  color: s.card ?? const Color(0xFF24252B), borderRadius: BorderRadius.circular(8)),
+              child: Row(children: [
+                Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(color: s.accent, borderRadius: BorderRadius.circular(6)),
+                    child: const Icon(Icons.desktop_windows, color: Colors.white, size: 20)),
+                const SizedBox(width: 10),
+                const Expanded(child: Text('PC052', style: TextStyle(color: Colors.white))),
+                Switch(value: true, onChanged: (_) {}, activeColor: s.accent),
+              ]),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(
+                  color: s.toolbar,
+                  borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12))),
+              child: const Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                Icon(Icons.clear, color: Colors.white),
+                Icon(Icons.tv, color: Colors.white),
+                Icon(Icons.filter_none, color: Colors.white),
+                Icon(Icons.keyboard, color: Colors.white),
+                Icon(Icons.more_vert, color: Colors.white),
+              ]),
+            ),
+          ]),
+        ),
+        const ListTile(title: Text('Ready-made skins', style: TextStyle(fontWeight: FontWeight.bold))),
+        SizedBox(
+          height: 76,
+          child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+            for (final p in [...WizzSkin.presets, ..._saved])
+              GestureDetector(
+                onTap: () => _set(p),
+                onLongPress: _saved.contains(p)
+                    ? () async {
+                        final ok = await showDialog<bool>(
+                            context: context,
+                            builder: (c) => AlertDialog(
+                                  title: Text('Delete the skin "${p.name}"?'),
+                                  actions: [
+                                    TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+                                    TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Delete')),
+                                  ],
+                                ));
+                        if (ok == true) {
+                          setState(() => _saved.remove(p));
+                          WizzSkin.saved = _saved;
+                        }
+                      }
+                    : null,
+                child: Container(
+                  width: 92,
+                  margin: const EdgeInsets.symmetric(horizontal: 4),
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: p.name == s.name ? s.accent : Colors.white24, width: p.name == s.name ? 2 : 1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      _swatch(p.accent, size: 18),
+                      const SizedBox(width: 3),
+                      _swatch(p.toolbar, size: 18),
+                      const SizedBox(width: 3),
+                      _swatch(p.download, size: 18),
+                    ]),
+                    const SizedBox(height: 6),
+                    Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)),
+                  ]),
+                ),
+              ),
+          ]),
+        ),
+        const Divider(),
+        _colorRow('Accent', 'Buttons, switches, selected tab, links', s.accent, (c) => s.accent = c ?? s.accent),
+        _colorRow('Session toolbar', 'The bar at the bottom of a session', s.toolbar, (c) => s.toolbar = c ?? s.toolbar),
+        _colorRow('Download bar', 'File copy & paste bar', s.download, (c) => s.download = c ?? s.download),
+        _colorRow('Extra keys', 'The extra keys row', s.keys, (c) => s.keys = c ?? s.keys),
+        _colorRow('Background', 'Dark theme background', s.background, (c) => s.background = c, optional: true),
+        _colorRow('Cards', 'Dark theme lists and cards', s.card, (c) => s.card = c, optional: true),
+        const Divider(),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Wrap(spacing: 8, runSpacing: 8, children: [
+            ElevatedButton.icon(
+              icon: const Icon(Icons.check),
+              label: const Text('Apply'),
+              onPressed: () async {
+                WizzSkin.current = _skin;
+                setState(() => _changed = false);
+                final restart = await showDialog<bool>(
+                  context: context,
+                  builder: (c) => AlertDialog(
+                    title: const Text('Skin applied'),
+                    content: const Text('Bars change right away. Restart the app to recolour '
+                        'everything else. Restarting closes open PCs.'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Later')),
+                      TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Restart now')),
+                    ],
+                  ),
+                );
+                if (restart == true) wizzRestartApp();
+              },
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.save_outlined),
+              label: const Text('Save as…'),
+              onPressed: () async {
+                final name = TextEditingController(text: s.name);
+                final ok = await showDialog<bool>(
+                  context: context,
+                  builder: (c) => AlertDialog(
+                    title: const Text('Save skin'),
+                    content: TextField(controller: name, decoration: const InputDecoration(labelText: 'Name')),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+                      TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Save')),
+                    ],
+                  ),
+                );
+                if (ok == true && name.text.trim().isNotEmpty) {
+                  setState(() {
+                    _skin.name = name.text.trim();
+                    _saved.removeWhere((e) => e.name == _skin.name);
+                    _saved.add(_skin.copy());
+                  });
+                  WizzSkin.saved = _saved;
+                }
+              },
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.ios_share),
+              label: const Text('Export'),
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: _skin.export()));
+                showToast('Skin copied. Paste it anywhere to share');
+              },
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.content_paste),
+              label: const Text('Import'),
+              onPressed: () async {
+                final d = await Clipboard.getData(Clipboard.kTextPlain);
+                final sk = WizzSkin.import(d?.text ?? '');
+                if (sk == null) {
+                  showToast('No skin found in the clipboard');
+                } else {
+                  _set(sk);
+                }
+              },
+            ),
+          ]),
+        ),
+        if (_changed)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('Not applied yet: tap Apply.', style: TextStyle(color: Colors.orange)),
+          ),
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('Light or dark mode: Settings → Theme. Long-press a saved skin to delete it.'),
+        ),
+      ]),
+    );
+  }
+}
+
+// ------------------------------------------------------- server profiles
+class WizzProfile {
+  String name;
+  String server;
+  String key;
+  Color color;
+  WizzProfile(this.name, this.server, this.key, this.color);
+  Map<String, dynamic> toJson() =>
+      {'name': name, 'server': server, 'key': key, 'color': wizzColorHex(color)};
+  static WizzProfile? fromJson(dynamic j) {
+    try {
+      return WizzProfile(j['name'].toString(), j['server'].toString(),
+          (j['key'] ?? '').toString(), wizzParseColor(j['color']) ?? Colors.teal);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static List<WizzProfile> get all {
+    try {
+      final v = bind.mainGetLocalOption(key: 'wizz-profiles');
+      if (v.isEmpty) return [];
+      return (jsonDecode(v) as List).map(fromJson).whereType<WizzProfile>().toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static set all(List<WizzProfile> l) => bind.mainSetLocalOption(
+      key: 'wizz-profiles', value: jsonEncode(l.map((e) => e.toJson()).toList()));
+}
+
+/// Which server the next connection uses: -1 = yours, -2 = RustDesk public,
+/// 0.. = a saved profile. Goes back to yours after each connection.
+final RxInt wizzNextProfile = (-1).obs;
+
+String wizzProfileId(String id) {
+  final sel = wizzNextProfile.value;
+  wizzNextProfile.value = -1;
+  if (id.contains('@') || sel == -1) return id;
+  if (sel == -2) return '$id@public';
+  final l = WizzProfile.all;
+  if (sel < 0 || sel >= l.length) return id;
+  final p = l[sel];
+  return p.key.isEmpty ? '$id@${p.server}' : '$id@${p.server}?key=${p.key}';
+}
+
+/// Badge info for a PC id like "123@public" or "123@host?key=…".
+(IconData, Color, String)? wizzServerBadge(String id) {
+  final at = id.indexOf('@');
+  if (at < 0) return null;
+  final server = id.substring(at + 1).split('?').first;
+  if (server == 'public') return (Icons.public, const Color(0xFF1E88E5), 'RustDesk public');
+  for (final p in WizzProfile.all) {
+    if (p.server == server) return (Icons.dns, p.color, p.name);
+  }
+  return (Icons.dns, Colors.blueGrey, server);
+}
+
+Widget wizzProfileChip(BuildContext context) {
+  return Obx(() {
+    final sel = wizzNextProfile.value;
+    final l = WizzProfile.all;
+    String label = 'Your server';
+    IconData icon = Icons.home_work_outlined;
+    Color? color;
+    if (sel == -2) {
+      label = 'RustDesk public';
+      icon = Icons.public;
+      color = const Color(0xFF1E88E5);
+    } else if (sel >= 0 && sel < l.length) {
+      label = l[sel].name;
+      icon = Icons.dns;
+      color = l[sel].color;
+    }
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 4, top: 4),
+        child: ActionChip(
+          avatar: Icon(icon, size: 18, color: color),
+          label: Text(sel == -1 ? 'Server: yours' : 'Next connection: $label'),
+          side: color == null ? null : BorderSide(color: color),
+          onPressed: () => showModalBottomSheet(
+            context: context,
+            builder: (ctx) => SafeArea(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const ListTile(
+                    title: Text('Connect through', style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text('Only for the next connection')),
+                ListTile(
+                  leading: const Icon(Icons.home_work_outlined),
+                  title: const Text('Your server'),
+                  trailing: sel == -1 ? const Icon(Icons.check) : null,
+                  onTap: () {
+                    wizzNextProfile.value = -1;
+                    Navigator.pop(ctx);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.public, color: Color(0xFF1E88E5)),
+                  title: const Text('RustDesk public'),
+                  subtitle: const Text('For friends on the normal RustDesk app'),
+                  trailing: sel == -2 ? const Icon(Icons.check) : null,
+                  onTap: () {
+                    wizzNextProfile.value = -2;
+                    Navigator.pop(ctx);
+                  },
+                ),
+                for (var i = 0; i < l.length; i++)
+                  ListTile(
+                    leading: Icon(Icons.dns, color: l[i].color),
+                    title: Text(l[i].name),
+                    subtitle: Text(l[i].server),
+                    trailing: sel == i ? const Icon(Icons.check) : null,
+                    onTap: () {
+                      wizzNextProfile.value = i;
+                      Navigator.pop(ctx);
+                    },
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.settings_outlined),
+                  title: const Text('Manage server profiles…'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => const WizzProfilesPage()));
+                  },
+                ),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+  });
+}
+
+class WizzProfilesPage extends StatefulWidget {
+  const WizzProfilesPage({Key? key}) : super(key: key);
+  @override
+  State<WizzProfilesPage> createState() => _WizzProfilesPageState();
+}
+
+class _WizzProfilesPageState extends State<WizzProfilesPage> {
+  late List<WizzProfile> _l = WizzProfile.all;
+
+  Future<void> _edit([int? index]) async {
+    final p = index == null ? WizzProfile('', '', '', Colors.teal) : _l[index];
+    final name = TextEditingController(text: p.name);
+    final server = TextEditingController(text: p.server);
+    final key = TextEditingController(text: p.key);
+    var color = p.color;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, setState) => AlertDialog(
+          title: Text(index == null ? 'New server profile' : 'Edit server profile'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(controller: name, decoration: const InputDecoration(labelText: 'Name (e.g. Company A)')),
+              TextField(
+                  controller: server,
+                  decoration: const InputDecoration(labelText: 'ID server (host or host:port)')),
+              TextField(controller: key, decoration: const InputDecoration(labelText: 'Key')),
+              const SizedBox(height: 12),
+              Row(children: [
+                const Text('Badge colour'),
+                const Spacer(),
+                GestureDetector(
+                  onTap: () async {
+                    final n = await wizzPickColor(context, color, 'Badge colour');
+                    if (n != null) setState(() => color = n);
+                  },
+                  child: Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+                ),
+              ]),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Save')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
+    final n = name.text.trim(), sv = server.text.trim();
+    if (n.isEmpty || sv.isEmpty || sv.contains('@') || sv.contains(' ')) {
+      showToast('Enter a name and a valid server');
+      return;
+    }
+    setState(() {
+      final np = WizzProfile(n, sv, key.text.trim(), color);
+      if (index == null) {
+        _l.add(np);
+      } else {
+        _l[index] = np;
+      }
+    });
+    WizzProfile.all = _l;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Server profiles')),
+      floatingActionButton: FloatingActionButton(onPressed: () => _edit(), child: const Icon(Icons.add)),
+      body: ListView(children: [
+        const ListTile(
+          leading: Icon(Icons.home_work_outlined),
+          title: Text('Your server'),
+          subtitle: Text('Settings → ID/Relay server. Used unless you pick another.'),
+        ),
+        const ListTile(
+          leading: Icon(Icons.public, color: Color(0xFF1E88E5)),
+          title: Text('RustDesk public'),
+          subtitle: Text('Built in. For friends using the normal RustDesk app.'),
+        ),
+        const Divider(),
+        for (var i = 0; i < _l.length; i++)
+          ListTile(
+            leading: Icon(Icons.dns, color: _l[i].color),
+            title: Text(_l[i].name),
+            subtitle: Text(_l[i].server + (_l[i].key.isEmpty ? '' : ' · key set')),
+            onTap: () => _edit(i),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () {
+                setState(() => _l.removeAt(i));
+                WizzProfile.all = _l;
+              },
+            ),
+          ),
+        const Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('Pick a server with the chip under the Remote ID box. It applies to the next '
+              'connection only; PCs on other servers get a badge in your lists. Only use other '
+              'companies\' servers with their permission.'),
+        ),
+      ]),
+    );
+  }
+}
+
+// -------------------------------------------------- share server settings
+class WizzServerConfigPage extends StatefulWidget {
+  const WizzServerConfigPage({Key? key}) : super(key: key);
+  @override
+  State<WizzServerConfigPage> createState() => _WizzServerConfigPageState();
+}
+
+class _WizzServerConfigPageState extends State<WizzServerConfigPage> {
+  ServerConfig? _sc;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final options = jsonDecode(await bind.mainGetOptions());
+      setState(() => _sc = ServerConfig.fromOptions(options));
+    } catch (_) {
+      setState(() => _sc = ServerConfig());
+    }
+  }
+
+  Future<void> _import(String? text) async {
+    var t = (text ?? '').trim();
+    if (t.startsWith('config=')) t = t.substring(7);
+    if (t.isEmpty) {
+      showToast('Clipboard is empty');
+      return;
+    }
+    importConfig(null, null, t);
+    await Future.delayed(const Duration(milliseconds: 800));
+    _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sc = _sc;
+    final enc = sc?.encode() ?? '';
+    return Scaffold(
+      appBar: AppBar(title: const Text('Share server settings')),
+      body: sc == null
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(padding: const EdgeInsets.all(16), children: [
+              if (sc.idServer.isEmpty)
+                const Text('No server is set. Set one in Settings → ID/Relay server first.')
+              else ...[
+                Center(
+                  child: Container(
+                    color: Colors.white,
+                    padding: const EdgeInsets.all(12),
+                    child: QrImageView(data: 'config=$enc', size: 220, backgroundColor: Colors.white),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                    'On another phone: Settings → scan icon (top right) and point it at this code. '
+                    'RustDesk on a PC can import the copied text in its network settings.',
+                    textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                ListTile(title: const Text('ID server'), subtitle: Text(sc.idServer)),
+                ListTile(title: const Text('Relay server'), subtitle: Text(sc.relayServer.isEmpty ? '(same as ID server)' : sc.relayServer)),
+                ListTile(title: const Text('API server'), subtitle: Text(sc.apiServer.isEmpty ? '(none)' : sc.apiServer)),
+                ListTile(
+                    title: const Text('Key'),
+                    subtitle: Text(sc.key.isEmpty ? '(none)' : '${sc.key.substring(0, sc.key.length.clamp(0, 6))}…')),
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.copy),
+                  label: const Text('Copy as text'),
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: enc));
+                    showToast('Server settings copied');
+                  },
+                ),
+              ],
+              const Divider(height: 32),
+              const Text('Import', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.content_paste),
+                label: const Text('Paste from clipboard'),
+                onPressed: () async {
+                  final d = await Clipboard.getData(Clipboard.kTextPlain);
+                  _import(d?.text);
+                },
+              ),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.qr_code_scanner),
+                label: const Text('Scan a QR code'),
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ScanPage())),
+              ),
+            ]),
+    );
+  }
+}
+
+// ----------------------------------------------------------------- mouse
+const List<String> kWizzAccelNames = ['off', 'low', 'medium', 'high'];
+
+/// How much a finger movement moves the cursor in mouse mode.
+double wizzMouseFactor(Offset delta) {
+  final s = WizzPrefs.mouseSpeed;
+  final a = WizzPrefs.mouseAccel;
+  if (a <= 0) return s;
+  const k = [0.0, 0.5, 1.0, 1.8];
+  final extra = (delta.distance - 2).clamp(0.0, 25.0) / 10.0;
+  return s * (1 + k[a] * extra);
+}
+
+class WizzMouseSettingsPage extends StatefulWidget {
+  const WizzMouseSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzMouseSettingsPage> createState() => _WizzMouseSettingsPageState();
+}
+
+class _WizzMouseSettingsPageState extends State<WizzMouseSettingsPage> {
+  Offset _dot = const Offset(150, 90);
+
+  @override
+  Widget build(BuildContext context) {
+    final speed = WizzPrefs.mouseSpeed;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Mouse')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text('For mouse mode (dragging moves the cursor). Touch mode is not affected.'),
+        const SizedBox(height: 16),
+        Text('Speed: ${speed.toStringAsFixed(1)}×', style: const TextStyle(fontWeight: FontWeight.bold)),
+        Row(children: [
+          IconButton(
+              icon: const Icon(Icons.remove),
+              onPressed: () => setState(() => WizzPrefs.mouseSpeed = speed - 0.1)),
+          Expanded(
+            child: Slider(
+              value: speed,
+              min: 0.5,
+              max: 3.0,
+              divisions: 25,
+              label: '${speed.toStringAsFixed(1)}×',
+              onChanged: (v) => setState(() => WizzPrefs.mouseSpeed = v),
+            ),
+          ),
+          IconButton(
+              icon: const Icon(Icons.add),
+              onPressed: () => setState(() => WizzPrefs.mouseSpeed = speed + 0.1)),
+        ]),
+        const SizedBox(height: 8),
+        const Text('Acceleration', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('Slow drags stay precise; quick flicks go further.'),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, children: [
+          for (var i = 0; i < 4; i++)
+            ChoiceChip(
+              label: Text(kWizzAccelNames[i][0].toUpperCase() + kWizzAccelNames[i].substring(1)),
+              selected: WizzPrefs.mouseAccel == i,
+              onSelected: (_) => setState(() => WizzPrefs.mouseAccel = i),
+            ),
+        ]),
+        const SizedBox(height: 20),
+        const Text('Try it: drag anywhere in the box', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        LayoutBuilder(builder: (context, c) {
+          final w = c.maxWidth, h = 200.0;
+          return GestureDetector(
+            onPanUpdate: (d) => setState(() {
+              final f = wizzMouseFactor(d.delta);
+              _dot = Offset((_dot.dx + d.delta.dx * f).clamp(0.0, w - 1),
+                  (_dot.dy + d.delta.dy * f).clamp(0.0, h - 1));
+            }),
+            child: Container(
+              width: w,
+              height: h,
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white24),
+              ),
+              child: Stack(children: [
+                Positioned(
+                  left: _dot.dx - 2,
+                  top: _dot.dy - 2,
+                  child: const Icon(Icons.near_me, size: 22, color: Colors.white),
+                ),
+              ]),
+            ),
+          );
+        }),
+        const SizedBox(height: 12),
+        TextButton(
+            onPressed: () => setState(() {
+                  WizzPrefs.mouseSpeed = 1.0;
+                  WizzPrefs.mouseAccel = 0;
+                }),
+            child: const Text('Reset (1.0×, no acceleration)')),
+      ]),
+    );
+  }
+}
+
+/// Where the extra keys row is (per session), so the download bar can sit below it.
+final ValueNotifier<MapEntry<Object, Rect>?> wizzKeysRect = ValueNotifier(null);
 '''
 
 
@@ -4187,6 +5403,510 @@ s = rep(s, '                "wizz_take_shared" -> ', """                "wizz_ta
                     wizzAction = ""
                 }
                 "wizz_take_shared" -> """)
+save(p, s)
+
+# ===== Wizz: skins, server profiles & sharing, mouse speed, compose keyboard, download pill, disconnect from home =====
+p = 'flutter/lib/common.dart'
+s = load(p)
+s = rep(s, "import 'dart:async';\n", "import 'dart:async';\nimport 'mobile/pages/wizz_settings.dart' show wizzSkinTheme;\n")
+s = rep(s, "  static ThemeData lightTheme = ThemeData(\n", "  static ThemeData lightTheme = wizzSkinTheme(ThemeData(\n")
+s = rep(s, "      TabbarTheme.light,\n    ],\n  );\n", "      TabbarTheme.light,\n    ],\n  ));\n")
+s = rep(s, "  static ThemeData darkTheme = ThemeData(\n", "  static ThemeData darkTheme = wizzSkinTheme(ThemeData(\n")
+s = rep(s, "      TabbarTheme.dark,\n    ],\n  );\n", "      TabbarTheme.dark,\n    ],\n  ));\n")
+save(p, s)
+
+p = 'flutter/lib/models/model.dart'
+s = load(p)
+s = rep(s, "import 'dart:async';\n", "import 'dart:async';\nimport '../mobile/pages/wizz_settings.dart' show wizzMouseFactor;\n")
+s = rep(s, "    double dx = delta.dx;\n    double dy = delta.dy;\n    if (parent.target?.imageModel.image == null) return;",
+        "    final wizzF = isAndroid ? wizzMouseFactor(delta) : 1.0;\n    double dx = delta.dx * wizzF;\n    double dy = delta.dy * wizzF;\n    if (parent.target?.imageModel.image == null) return;")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/connection_page.dart'
+s = load(p)
+s = rep(s, "import 'wizz_sessions.dart';\n", "import 'wizz_sessions.dart';\nimport 'wizz_settings.dart';\n")
+s = rep(s, "    var id = _idController.id;\n    connect(context, id);", "    var id = wizzProfileId(_idController.id);\n    connect(context, id);")
+s = rep(s, "          _buildRemoteIDTextField(),\n        ])),", "          _buildRemoteIDTextField(),\n          wizzProfileChip(context),\n        ])),")
+save(p, s)
+
+p = 'flutter/lib/common/widgets/peer_card.dart'
+s = load(p)
+s = rep(s, """      _terminalAction(context),
+    ];
+
+    if (peer.platform == kPeerPlatformWindows) {""", """      _terminalAction(context),
+    ];
+    if (isAndroid && wizzIsOpen(peer.id)) {
+      menuItems.insert(
+          0,
+          MenuEntryButton<String>(
+            childBuilder: (TextStyle? style) => Text('Disconnect',
+                style: (style ?? const TextStyle()).copyWith(color: Colors.red)),
+            proc: () => wizzDisconnectId(peer.id),
+            padding: menuPadding,
+            dismissOnClicked: true,
+          ));
+    }
+
+    if (peer.platform == kPeerPlatformWindows) {""")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/home_page.dart'
+s = load(p)
+s = rep(s, "            selectedItemColor: MyTheme.accent, //", "            selectedItemColor: WizzSkin.current.accent, //")
+s = rep(s, "            actions: _pages.elementAt(_selectedIndex).appBarActions,\n",
+        """            actions: [
+              ..._pages.elementAt(_selectedIndex).appBarActions,
+              if (widget.wizzMini)
+                IconButton(
+                    tooltip: 'Disconnect all',
+                    icon: const Icon(Icons.clear_all),
+                    onPressed: () => wizzConfirmDisconnectAll(context)),
+            ],
+""")
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, "      data: const IconThemeData(shadows: kWizzTextOutline),", "      data: const IconThemeData(size: 26),")
+s = rep(s, "                  backgroundColor: MyTheme.accent,", "                  backgroundColor: WizzSkin.current.accent,")
+# extra keys row: skin colour, frosted buttons, bolder labels, Ctrl+Alt+Del, position for the download bar
+s = rep(s, "        color: wizzBarColor(WizzPrefs.keysSeeThrough),", "        color: wizzBarColor(WizzPrefs.keysSeeThrough, base: WizzSkin.current.keys),")
+s = rep(s, "          backgroundColor: active == true ? MyTheme.accent80 : null,",
+        "          backgroundColor: active == true\n              ? WizzSkin.current.accent.withOpacity(0.67)\n              : (wizzFrosted(WizzPrefs.keysSeeThrough) ? kWizzFrost : null),")
+s = rep(s, "                style: TextStyle(color: Colors.white, fontSize: 11, shadows: kWizzTextOutline)),",
+        "                style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600, shadows: kWizzTextOutline)),")
+s = rep(s, """      wrap('Enter', () {
+        inputModel.inputKey('VK_ENTER');
+      }),
+      SizedBox(width: 9999),""", """      wrap('Enter', () {
+        inputModel.inputKey('VK_ENTER');
+      }),
+      if (isWin)
+        wrap('Ctrl+Alt+Del', () {
+          bind.sessionCtrlAltDel(sessionId: _ffi.sessionId);
+        }),
+      SizedBox(width: 9999),""")
+s = rep(s, """      _ffi.cursorModel.keyHelpToolsVisibilityChanged(
+          Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height),
+          widget.keyboardIsVisible);""", """      _ffi.cursorModel.keyHelpToolsVisibilityChanged(
+          Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height),
+          widget.keyboardIsVisible);
+      wizzKeysRect.value =
+          MapEntry(_ffi, Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height));""")
+s = rep(s, """      _ffi.cursorModel
+          .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
+      return Offstage();""", """      _ffi.cursorModel
+          .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
+      if (identical(wizzKeysRect.value?.key, _ffi)) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (identical(wizzKeysRect.value?.key, _ffi)) wizzKeysRect.value = null;
+        });
+      }
+      return Offstage();""")
+# keyboard button: hold for the "keyboard with send" box
+s = rep(s, """                              wizzTb('keyboard', IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(Icons.keyboard),
+                                  onPressed: openKeyboard)),""", """                              wizzTb('keyboard', GestureDetector(
+                                  onLongPress: _wizzKeyboardMenu,
+                                  child: IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(Icons.keyboard),
+                                  onPressed: () {
+                                    if (_wizzCompose) setState(() => _wizzCompose = false);
+                                    openKeyboard();
+                                  }))),""", count=2)
+s = rep(s, "            if (widget.active) _wizzClipBanner(),\n",
+        "            if (widget.active) _wizzClipBanner(),\n            if (widget.active && _wizzCompose) _wizzComposeBar(),\n")
+s = rep(s, "    _wizzClipTimer?.cancel();\n    _wizzHideTimer?.cancel();\n", "    _wizzClipTimer?.cancel();\n    _wizzHideTimer?.cancel();\n    _wizzPillTimer?.cancel();\n    _wizzComposeCtl.dispose();\n    _wizzComposeFocus.dispose();\n")
+# the download bar: skin colour, frosted, below the extra keys, shrinks to a pill
+i = s.index("  Widget _wizzClipBanner() {")
+j = s.index("  // Background PCs: clipboard off", i)
+s = s[:i] + r"""  // ---- keyboard with send (hold the keyboard button)
+  bool _wizzCompose = false;
+  final _wizzComposeCtl = TextEditingController();
+  final _wizzComposeFocus = FocusNode();
+
+  void _wizzKeyboardMenu() {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.keyboard),
+            title: const Text('Keyboard'),
+            subtitle: const Text('Keys go straight to the PC'),
+            onTap: () {
+              Navigator.pop(ctx);
+              setState(() => _wizzCompose = false);
+              openKeyboard();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.send),
+            title: const Text('Keyboard with send'),
+            subtitle: const Text('Type or dictate with autocorrect, then send it all at once'),
+            onTap: () {
+              Navigator.pop(ctx);
+              setState(() {
+                _showEdit = false;
+                _wizzCompose = true;
+              });
+              Future.delayed(const Duration(milliseconds: 250), () {
+                if (mounted) _wizzComposeFocus.requestFocus();
+              });
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  void _wizzComposeSend() {
+    final t = _wizzComposeCtl.text;
+    if (t.isEmpty) {
+      _ffi.inputModel.inputKey('VK_ENTER');
+    } else {
+      bind.sessionInputString(sessionId: sessionId, value: t);
+      _wizzComposeCtl.clear();
+    }
+  }
+
+  Future<void> _wizzComposeMic() async {
+    final t = await _ffi.invokeMethodWithResult<String>('wizz_speech');
+    if (t == null || t.isEmpty || !mounted) return;
+    final cur = _wizzComposeCtl.text;
+    _wizzComposeCtl.text = cur.isEmpty ? t : '$cur $t';
+    _wizzComposeCtl.selection =
+        TextSelection.collapsed(offset: _wizzComposeCtl.text.length);
+    _wizzComposeFocus.requestFocus();
+  }
+
+  Widget _wizzComposeBar() {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: Material(
+        color: const Color(0xF0202124),
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Row(children: [
+            IconButton(
+              icon: const Icon(Icons.close, color: Colors.white),
+              onPressed: () {
+                _wizzComposeFocus.unfocus();
+                setState(() => _wizzCompose = false);
+              },
+            ),
+            Expanded(
+              child: TextField(
+                controller: _wizzComposeCtl,
+                focusNode: _wizzComposeFocus,
+                minLines: 1,
+                maxLines: 4,
+                keyboardType: TextInputType.multiline,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  hintText: 'Type, then send',
+                  hintStyle: TextStyle(color: Colors.white54),
+                  border: InputBorder.none,
+                  isDense: true,
+                ),
+              ),
+            ),
+            IconButton(
+                icon: const Icon(Icons.mic, color: Colors.white),
+                onPressed: _wizzComposeMic),
+            IconButton(
+                icon: Icon(Icons.send, color: WizzSkin.current.accent),
+                onPressed: _wizzComposeSend),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // ---- download bar
+  bool _wizzPill = false;
+  String _wizzPillKey = '';
+  Timer? _wizzPillTimer;
+
+  Widget _wizzClipBanner() {
+    final st = (_wizzClip['state'] ?? 'idle').toString();
+    final seq = (_wizzClip['seq'] ?? 0) as int;
+    if (st == 'idle' ||
+        (seq == _wizzClipHiddenSeq && st == _wizzClipHiddenState)) {
+      return const SizedBox.shrink();
+    }
+    final see = WizzPrefs.barSeeThrough;
+    final frost = wizzFrosted(see);
+    final count = (_wizzClip['count'] ?? 0) as int;
+    final bytes = (_wizzClip['bytes'] ?? 0) as num;
+    final done = (_wizzClip['done'] ?? 0) as num;
+    final names = ((_wizzClip['names'] ?? []) as List).cast<dynamic>();
+    final what =
+        count == 1 && names.isNotEmpty ? names.first.toString() : '$count items';
+    final dir = (_wizzClip['dir'] ?? '')
+        .toString()
+        .replaceFirst('/storage/emulated/0/', '');
+    final msg = (_wizzClip['msg'] ?? '').toString();
+    // shrink to a pill after a while (Settings → File copy & paste)
+    final pillKey = '$seq/$st';
+    if (pillKey != _wizzPillKey) {
+      _wizzPillKey = pillKey;
+      _wizzPill = false;
+      _wizzPillTimer?.cancel();
+      final n = WizzPrefs.barShrink;
+      if (n > 0 && st != 'error') {
+        _wizzPillTimer = Timer(Duration(seconds: n), () {
+          if (mounted && _wizzPillKey == pillKey) setState(() => _wizzPill = true);
+        });
+      }
+    }
+    String text;
+    double? progress;
+    final actions = <Widget>[];
+    switch (st) {
+      case 'offered':
+        text = 'Copied on PC: $what (${_wizzSize(bytes)})';
+        actions.add(_wizzAct('Download', _wizzClipDownload, frost));
+        break;
+      case 'downloading':
+        final pv = bytes > 0 ? (done / bytes).clamp(0.0, 1.0).toDouble() : 0.0;
+        progress = bytes > 0 ? pv : null;
+        final pct = bytes > 0 ? '${(pv * 100).toStringAsFixed(0)}% · ' : '';
+        text = 'Downloading $pct${_wizzSize(done)} / ${_wizzSize(bytes)}';
+        actions.add(_wizzAct('Cancel', () => _wizzClipCall('wizz-clip-cancel'), frost));
+        break;
+      case 'done':
+        final saved = ((_wizzClip['saved'] ?? []) as List).cast<dynamic>();
+        final single = msg == 'single' && saved.length == 1;
+        progress = 1;
+        if (_wizzToTree && _wizzTreeBusy) {
+          text = 'Saving to ${_wizzTarget!.label}…';
+          progress = null;
+          break;
+        }
+        if (_wizzToTree) {
+          text = 'Saved to ${_wizzTarget!.label}';
+          actions.add(_wizzAct(single ? 'Open' : 'Show', () {
+            if (single && _wizzTreeUris.length == 1) {
+              _ffi.invokeMethod("wizz_open_uri", _wizzTreeUris.first);
+            } else {
+              _ffi.invokeMethod("wizz_open_uri", _wizzTarget!.tree);
+            }
+          }, frost));
+        } else {
+          text = 'Saved to $dir';
+          actions.add(_wizzAct(single ? 'Open' : 'Show', () {
+            if (single) {
+              _ffi.invokeMethod("wizz_open_file", saved.first.toString());
+            } else {
+              _ffi.invokeMethod("wizz_show_downloads");
+            }
+          }, frost));
+        }
+        actions.add(_wizzAct('Delete', () => _wizzConfirmDelete(what), frost));
+        final hide = WizzPrefs.autoHide;
+        if (hide > 0 && _wizzHideSeq != seq) {
+          _wizzHideSeq = seq;
+          _wizzHideTimer?.cancel();
+          _wizzHideTimer = Timer(Duration(seconds: hide), () {
+            if (!mounted) return;
+            setState(() {
+              _wizzClipHiddenSeq = seq;
+              _wizzClipHiddenState = 'done';
+            });
+          });
+        }
+        break;
+      default:
+        text = 'Download failed: $msg';
+    }
+    void close() {
+      if (st != 'downloading') {
+        _wizzClipCall('wizz-clip-dismiss');
+      }
+      setState(() {
+        _wizzClipHiddenSeq = seq;
+        _wizzClipHiddenState = st;
+      });
+    }
+
+    final atBottom = WizzPrefs.barBottom;
+    final colour = wizzBarColor(see, base: WizzSkin.current.download);
+    Widget round(IconData icon, void Function() onTap, {String? tip}) => Container(
+          margin: const EdgeInsets.symmetric(horizontal: 2),
+          decoration: frost
+              ? const BoxDecoration(color: kWizzFrost, shape: BoxShape.circle)
+              : null,
+          child: IconButton(
+            tooltip: tip,
+            visualDensity: VisualDensity.compact,
+            icon: Icon(icon, color: Colors.white, size: 20),
+            onPressed: onTap,
+          ),
+        );
+
+    final Widget body;
+    if (_wizzPill) {
+      body = Align(
+        alignment: Alignment.centerRight,
+        child: Material(
+          color: colour,
+          borderRadius: BorderRadius.circular(24),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(10, 2, 2, 2),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              if (st == 'downloading' || (st == 'done' && _wizzTreeBusy))
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                      value: progress, strokeWidth: 2.5, color: WizzSkin.current.accent),
+                )
+              else
+                Icon(
+                    st == 'done'
+                        ? Icons.check_circle
+                        : (st == 'offered' ? Icons.file_copy : Icons.error),
+                    size: 18,
+                    color: st == 'done'
+                        ? Colors.greenAccent
+                        : (st == 'offered' ? Colors.white : Colors.redAccent)),
+              const SizedBox(width: 2),
+              round(Icons.open_in_full, () {
+                _wizzPillTimer?.cancel();
+                setState(() => _wizzPill = false);
+              }, tip: 'Expand'),
+              round(Icons.close, close, tip: 'Close'),
+            ]),
+          ),
+        ),
+      );
+    } else {
+      body = Material(
+        color: colour,
+        borderRadius: BorderRadius.circular(10),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.file_copy, color: Colors.white, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Container(
+                      padding: frost
+                          ? const EdgeInsets.symmetric(horizontal: 8, vertical: 4)
+                          : EdgeInsets.zero,
+                      decoration: frost
+                          ? BoxDecoration(
+                              color: kWizzFrost, borderRadius: BorderRadius.circular(8))
+                          : null,
+                      child: Text(text,
+                          style: const TextStyle(
+                              color: Colors.white, fontWeight: FontWeight.w600),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                  ...actions,
+                  round(Icons.close_fullscreen, () {
+                    _wizzPillTimer?.cancel();
+                    setState(() => _wizzPill = true);
+                  }, tip: 'Minimize'),
+                  round(Icons.close, close, tip: 'Close'),
+                ],
+              ),
+              if (st == 'downloading' || (st == 'done' && _wizzTreeBusy))
+                Padding(
+                  padding: const EdgeInsets.only(right: 8, bottom: 6),
+                  child: LinearProgressIndicator(
+                      value: progress, color: WizzSkin.current.accent),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+    return ValueListenableBuilder<MapEntry<Object, Rect>?>(
+      valueListenable: wizzKeysRect,
+      builder: (context, keys, _) {
+        final keysH = identical(keys?.key, _ffi) ? keys!.value.height : null;
+        return Positioned(
+          top: atBottom ? null : (keysH != null ? keysH + 6 : 8),
+          bottom: atBottom ? 8 : null,
+          left: 8,
+          right: 8,
+          child: body,
+        );
+      },
+    );
+  }
+
+""" + s[j:]
+s = rep(s, """  Widget _wizzAct(String label, void Function() onPressed) => TextButton(
+      onPressed: onPressed,
+      child: Text(label,
+          style: const TextStyle(
+              fontWeight: FontWeight.bold, shadows: kWizzTextOutline)));""", """  Widget _wizzAct(String label, void Function() onPressed, [bool frost = false]) =>
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white,
+              backgroundColor: frost ? kWizzFrost : null,
+              visualDensity: VisualDensity.compact,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            ),
+            onPressed: onPressed,
+            child: Text(label, style: const TextStyle(fontWeight: FontWeight.bold))),
+      );""")
+save(p, s)
+
+# Android: restart (for the skin) and speech input (keyboard with send)
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, "    private var wizzAction = \"\"\n", "    private var wizzAction = \"\"\n    private var wizzSpeechResult: MethodChannel.Result? = null\n")
+s = rep(s, "        if (requestCode == 7311) {\n", """        if (requestCode == 7312) {
+            val r = wizzSpeechResult ?: return
+            wizzSpeechResult = null
+            val text = data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            r.success(if (resultCode == Activity.RESULT_OK) text else null)
+            return
+        }
+        if (requestCode == 7311) {
+""")
+s = rep(s, '                "wizz_take_action" -> {\n', """                "wizz_speech" -> {
+                    wizzSpeechResult = result
+                    try {
+                        startActivityForResult(
+                            Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                                .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                                    android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM), 7312)
+                    } catch (e: Exception) {
+                        wizzSpeechResult = null
+                        result.success(null)
+                    }
+                }
+                "wizz_restart" -> {
+                    result.success(true)
+                    val i = packageManager.getLaunchIntentForPackage(packageName)
+                    if (i != null) {
+                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                        startActivity(i)
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        Runtime.getRuntime().exit(0)
+                    }, 500)
+                }
+                "wizz_take_action" -> {
+""")
 save(p, s)
 
 print('wizz multi-session patch applied')
