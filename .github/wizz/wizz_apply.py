@@ -689,6 +689,10 @@ WIZZ_SWITCHER_DART = r'''// Wizz: hold the sessions button to see every open PC 
 // (like hovering over the Windows taskbar). Slide onto one and let go, or let
 // go first and tap one. Optional: swipe the bottom toolbar to change PC.
 import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
+
+import 'package:path_provider/path_provider.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1467,6 +1471,112 @@ Widget _wizzBadged(String id, Widget tile) {
     ),
   ]);
 }
+
+
+Widget wizzFrostIf(Widget w) =>
+    WizzPrefs.tbFloat && wizzFrosted(WizzPrefs.tbSeeThrough) ? _wizzFrost(w) : w;
+
+// ------------------------------------------------------------- screenshot
+final ValueNotifier<int> wizzFlash = ValueNotifier(0);
+
+/// Saves what the phone shows of the PC (full PC resolution) to Pictures/RustDesk.
+Future<void> wizzScreenshot(FFI ffi) async {
+  final img = ffi.imageModel.image;
+  if (img == null) {
+    wizzToast('No picture yet');
+    return;
+  }
+  ui.Image? copy;
+  try {
+    copy = img.clone();
+    wizzFlash.value++;
+    HapticFeedback.lightImpact();
+    final bd = await copy.toByteData(format: ui.ImageByteFormat.png);
+    if (bd == null) throw 'encode';
+    String title = 'PC';
+    for (final s in WizzSessions.to.sessions) {
+      if (identical(s.ffi, ffi)) title = s.title;
+    }
+    final name = title.replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_');
+    final n = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final ts = '${n.year}-${two(n.month)}-${two(n.day)}_${two(n.hour)}-${two(n.minute)}-${two(n.second)}';
+    final dirs = <String>['/storage/emulated/0/Pictures/RustDesk'];
+    try {
+      final d = await getExternalStorageDirectory();
+      if (d != null) dirs.add('${d.path}/Screenshots');
+    } catch (_) {}
+    File? saved;
+    for (final dir in dirs) {
+      try {
+        await Directory(dir).create(recursive: true);
+        final f = File('$dir/${name}_$ts.png');
+        await f.writeAsBytes(bd.buffer.asUint8List(), flush: true);
+        saved = f;
+        break;
+      } catch (_) {}
+    }
+    if (saved == null) throw 'save';
+    gFFI.invokeMethod('wizz_media_scan', saved.path);
+    gFFI.invokeMethod('wizz_dl_notify', {
+      'state': 'done',
+      'nid': 7320,
+      'title': 'Screenshot of $title saved',
+      'text': '${saved.path.replaceFirst('/storage/emulated/0/', '')} · tap to open',
+      'progress': 100,
+      'path': saved.path,
+    });
+    wizzToast('Screenshot saved');
+  } catch (_) {
+    wizzToast('Could not save the screenshot');
+  } finally {
+    copy?.dispose();
+  }
+}
+
+/// Brief white flash over the session when a screenshot is taken.
+class WizzFlash extends StatefulWidget {
+  const WizzFlash({Key? key}) : super(key: key);
+  @override
+  State<WizzFlash> createState() => _WizzFlashState();
+}
+
+class _WizzFlashState extends State<WizzFlash> {
+  double _o = 0;
+
+  void _on() {
+    if (!mounted) return;
+    setState(() => _o = 0.6);
+    Future.delayed(const Duration(milliseconds: 90), () {
+      if (mounted) setState(() => _o = 0);
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    wizzFlash.addListener(_on);
+  }
+
+  @override
+  void dispose() {
+    wizzFlash.removeListener(_on);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: AnimatedOpacity(
+          opacity: _o,
+          duration: const Duration(milliseconds: 120),
+          child: Container(color: Colors.white),
+        ),
+      ),
+    );
+  }
+}
 '''
 
 WIZZ_SETTINGS_DART = r'''// Wizz: Multiview settings (app lock, favourite keys, file copy & paste),
@@ -1488,6 +1598,7 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import 'remote_page.dart' show sendPrompt;
 import 'scan_page.dart';
+import 'wizz_switcher.dart' show wizzScreenshot;
 
 // ------------------------------------------------------------------ prefs
 class WizzPrefs {
@@ -1565,6 +1676,19 @@ class WizzPrefs {
     _set('mouse-accel', '$_mouseAccel');
   }
 
+  // keyboard
+  static String get kbDefault {
+    final v = _get('kb-default', 'normal');
+    return const ['normal', 'nopred', 'send'].contains(v) ? v : 'normal';
+  }
+  static set kbDefault(String v) => _set('kb-default', v);
+  static bool get kbNoPredAlt => _get('kb-nopred-alt', 'N') == 'Y';
+  static set kbNoPredAlt(bool v) => _set('kb-nopred-alt', v ? 'Y' : 'N');
+
+  // tag for your own server (ID@wizz)
+  static String get ownTag => _get('own-tag', 'wizz');
+  static set ownTag(String v) => _set('own-tag', v);
+
   // switching PCs
   static bool get swipeSwitch => _get('swipe-switch', 'N') == 'Y';
   static set swipeSwitch(bool v) => _set('swipe-switch', v ? 'Y' : 'N');
@@ -1607,18 +1731,20 @@ const Map<String, String> kWizzTbLabels = {
   'display': 'Display',
   'pcs': 'PCs',
   'minimize': 'Minimize',
+  'shot': 'Screenshot',
   'keyboard': 'Keyboard',
   'touch': 'Mouse / touch',
   'chat': 'Chat',
 };
 const List<String> kWizzTbDefault = [
-  'close', 'display', 'pcs', 'minimize', 'keyboard', 'touch', 'chat'
+  'close', 'display', 'pcs', 'minimize', 'shot', 'keyboard', 'touch', 'chat'
 ];
 const Map<String, IconData> kWizzTbIcons = {
   'close': Icons.clear,
   'display': Icons.tv,
   'pcs': Icons.filter_none,
   'minimize': Icons.minimize,
+  'shot': Icons.photo_camera_outlined,
   'keyboard': Icons.keyboard,
   'touch': Icons.mouse,
   'chat': Icons.message,
@@ -1700,6 +1826,7 @@ final Map<String, WizzKey> kWizzKeys = {
   'task_mgr': WizzKey('Ctrl+Shift+Esc',
       (f, m) => _wizzChord(f, 'VK_ESCAPE', ctrl: true, shift: true)),
   'cad': WizzKey('Ctrl+Alt+Del', (f, m) => bind.sessionCtrlAltDel(sessionId: f.sessionId)),
+  'shot': WizzKey('Screenshot', (f, m) => wizzScreenshot(f), icon: Icons.photo_camera_outlined),
 };
 
 const List<String> kWizzDefaultKeys = [
@@ -2083,6 +2210,15 @@ SettingsSection wizzSettingsSection(BuildContext context, void Function() refres
       value: const Text('Export or import as QR code or text'),
       leading: const Icon(Icons.qr_code_2),
       onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzServerConfigPage())),
+    ),
+    SettingsTile(
+      title: const Text('Keyboard'),
+      value: Text('Tap opens: ${kWizzKbNames[WizzPrefs.kbDefault]}'),
+      leading: const Icon(Icons.keyboard_outlined),
+      onPressed: (c) async {
+        await Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzKeyboardSettingsPage()));
+        refresh();
+      },
     ),
     SettingsTile(
       title: const Text('Mouse'),
@@ -3100,18 +3236,29 @@ class _WizzSkinEditorPageState extends State<WizzSkinEditorPage> {
 }
 
 // ------------------------------------------------------- server profiles
+String wizzTagFrom(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9-]'), '');
+bool wizzValidTag(String t) => RegExp(r'^[a-z0-9-]{1,24}$').hasMatch(t) && t != 'public';
+
 class WizzProfile {
   String name;
   String server;
   String key;
   Color color;
-  WizzProfile(this.name, this.server, this.key, this.color);
-  Map<String, dynamic> toJson() =>
-      {'name': name, 'server': server, 'key': key, 'color': wizzColorHex(color)};
+  String tag;
+  WizzProfile(this.name, this.server, this.key, this.color, {String? tag})
+      : tag = tag ?? wizzTagFrom(name);
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'server': server,
+        'key': key,
+        'color': wizzColorHex(color),
+        'tag': tag
+      };
   static WizzProfile? fromJson(dynamic j) {
     try {
       return WizzProfile(j['name'].toString(), j['server'].toString(),
-          (j['key'] ?? '').toString(), wizzParseColor(j['color']) ?? Colors.teal);
+          (j['key'] ?? '').toString(), wizzParseColor(j['color']) ?? Colors.teal,
+          tag: j['tag']?.toString());
     } catch (_) {
       return null;
     }
@@ -3135,15 +3282,33 @@ class WizzProfile {
 /// 0.. = a saved profile. Goes back to yours after each connection.
 final RxInt wizzNextProfile = (-1).obs;
 
+String _wizzWithProfile(String id, WizzProfile p) =>
+    p.key.isEmpty ? '$id@${p.server}' : '$id@${p.server}?key=${p.key}';
+
+/// Typed "ID@tag" picks a server profile (ID@public, ID@wizz = yours);
+/// otherwise the chip decides. Tags are expanded to the real server here.
 String wizzProfileId(String id) {
   final sel = wizzNextProfile.value;
   wizzNextProfile.value = -1;
-  if (id.contains('@') || sel == -1) return id;
+  final at = id.indexOf('@');
+  if (at >= 0) {
+    final raw = id.substring(0, at);
+    final rest = id.substring(at + 1);
+    if (rest.contains('?') || rest.contains('.') || rest.contains(':')) return id;
+    final tag = rest.toLowerCase();
+    if (tag == 'public') return '$raw@public';
+    if (tag == WizzPrefs.ownTag.toLowerCase()) return raw;
+    for (final p in WizzProfile.all) {
+      if (p.tag.toLowerCase() == tag) return _wizzWithProfile(raw, p);
+    }
+    showToast('No server profile with the tag @$rest');
+    return id;
+  }
+  if (sel == -1) return id;
   if (sel == -2) return '$id@public';
   final l = WizzProfile.all;
   if (sel < 0 || sel >= l.length) return id;
-  final p = l[sel];
-  return p.key.isEmpty ? '$id@${p.server}' : '$id@${p.server}?key=${p.key}';
+  return _wizzWithProfile(id, l[sel]);
 }
 
 /// Badge info for a PC id like "123@public" or "123@host?key=…".
@@ -3191,7 +3356,7 @@ Widget wizzProfileChip(BuildContext context) {
                     subtitle: Text('Only for the next connection')),
                 ListTile(
                   leading: const Icon(Icons.home_work_outlined),
-                  title: const Text('Your server'),
+                  title: Text('Your server · @${WizzPrefs.ownTag}'),
                   trailing: sel == -1 ? const Icon(Icons.check) : null,
                   onTap: () {
                     wizzNextProfile.value = -1;
@@ -3200,7 +3365,7 @@ Widget wizzProfileChip(BuildContext context) {
                 ),
                 ListTile(
                   leading: const Icon(Icons.public, color: Color(0xFF1E88E5)),
-                  title: const Text('RustDesk public'),
+                  title: const Text('RustDesk public · @public'),
                   subtitle: const Text('For friends on the normal RustDesk app'),
                   trailing: sel == -2 ? const Icon(Icons.check) : null,
                   onTap: () {
@@ -3211,7 +3376,7 @@ Widget wizzProfileChip(BuildContext context) {
                 for (var i = 0; i < l.length; i++)
                   ListTile(
                     leading: Icon(Icons.dns, color: l[i].color),
-                    title: Text(l[i].name),
+                    title: Text('${l[i].name} · @${l[i].tag}'),
                     subtitle: Text(l[i].server),
                     trailing: sel == i ? const Icon(Icons.check) : null,
                     onTap: () {
@@ -3237,19 +3402,30 @@ Widget wizzProfileChip(BuildContext context) {
 }
 
 class WizzProfilesPage extends StatefulWidget {
-  const WizzProfilesPage({Key? key}) : super(key: key);
+  final WizzProfile? prefill;
+  const WizzProfilesPage({Key? key, this.prefill}) : super(key: key);
   @override
   State<WizzProfilesPage> createState() => _WizzProfilesPageState();
 }
 
 class _WizzProfilesPageState extends State<WizzProfilesPage> {
   late List<WizzProfile> _l = WizzProfile.all;
+  late final _ownTag = TextEditingController(text: WizzPrefs.ownTag);
 
-  Future<void> _edit([int? index]) async {
-    final p = index == null ? WizzProfile('', '', '', Colors.teal) : _l[index];
+  @override
+  void initState() {
+    super.initState();
+    if (widget.prefill != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _edit(null, widget.prefill));
+    }
+  }
+
+  Future<void> _edit([int? index, WizzProfile? initial]) async {
+    final p = index == null ? (initial ?? WizzProfile('', '', '', Colors.teal)) : _l[index];
     final name = TextEditingController(text: p.name);
     final server = TextEditingController(text: p.server);
     final key = TextEditingController(text: p.key);
+    final tag = TextEditingController(text: index == null && p.name.isEmpty ? '' : p.tag);
     var color = p.color;
     final ok = await showDialog<bool>(
       context: context,
@@ -3258,7 +3434,16 @@ class _WizzProfilesPageState extends State<WizzProfilesPage> {
           title: Text(index == null ? 'New server profile' : 'Edit server profile'),
           content: SingleChildScrollView(
             child: Column(mainAxisSize: MainAxisSize.min, children: [
-              TextField(controller: name, decoration: const InputDecoration(labelText: 'Name (e.g. Company A)')),
+              TextField(
+                  controller: name,
+                  decoration: const InputDecoration(labelText: 'Name (e.g. Company A)'),
+                  onChanged: (v) {
+                    if (index == null) tag.text = wizzTagFrom(v);
+                  }),
+              TextField(
+                  controller: tag,
+                  decoration: const InputDecoration(
+                      labelText: 'Tag (type ID@tag to use this server)', prefixText: '@')),
               TextField(
                   controller: server,
                   decoration: const InputDecoration(labelText: 'ID server (host or host:port)')),
@@ -3289,12 +3474,19 @@ class _WizzProfilesPageState extends State<WizzProfilesPage> {
     );
     if (ok != true) return;
     final n = name.text.trim(), sv = server.text.trim();
+    final tg = (tag.text.trim().isEmpty ? wizzTagFrom(n) : tag.text.trim()).toLowerCase();
     if (n.isEmpty || sv.isEmpty || sv.contains('@') || sv.contains(' ')) {
       showToast('Enter a name and a valid server');
       return;
     }
+    final clash = tg == WizzPrefs.ownTag.toLowerCase() ||
+        _l.asMap().entries.any((e) => e.key != index && e.value.tag == tg);
+    if (!wizzValidTag(tg) || clash) {
+      showToast('Tag: letters, numbers and dashes, unique, not "public"');
+      return;
+    }
     setState(() {
-      final np = WizzProfile(n, sv, key.text.trim(), color);
+      final np = WizzProfile(n, sv, key.text.trim(), color, tag: tg);
       if (index == null) {
         _l.add(np);
       } else {
@@ -3310,21 +3502,33 @@ class _WizzProfilesPageState extends State<WizzProfilesPage> {
       appBar: AppBar(title: const Text('Server profiles')),
       floatingActionButton: FloatingActionButton(onPressed: () => _edit(), child: const Icon(Icons.add)),
       body: ListView(children: [
-        const ListTile(
-          leading: Icon(Icons.home_work_outlined),
-          title: Text('Your server'),
-          subtitle: Text('Settings → ID/Relay server. Used unless you pick another.'),
+        ListTile(
+          leading: const Icon(Icons.home_work_outlined),
+          title: const Text('Your server'),
+          subtitle: const Text('Settings → ID/Relay server. Used unless you pick another. '
+              'A plain ID always uses it.'),
+          trailing: SizedBox(
+            width: 110,
+            child: TextField(
+              controller: _ownTag,
+              decoration: const InputDecoration(prefixText: '@', isDense: true),
+              onChanged: (v) {
+                final t = v.trim().toLowerCase();
+                if (wizzValidTag(t) && !_l.any((p) => p.tag == t)) WizzPrefs.ownTag = t;
+              },
+            ),
+          ),
         ),
         const ListTile(
           leading: Icon(Icons.public, color: Color(0xFF1E88E5)),
-          title: Text('RustDesk public'),
+          title: Text('RustDesk public · @public'),
           subtitle: Text('Built in. For friends using the normal RustDesk app.'),
         ),
         const Divider(),
         for (var i = 0; i < _l.length; i++)
           ListTile(
             leading: Icon(Icons.dns, color: _l[i].color),
-            title: Text(_l[i].name),
+            title: Text('${_l[i].name} · @${_l[i].tag}'),
             subtitle: Text(_l[i].server + (_l[i].key.isEmpty ? '' : ' · key set')),
             onTap: () => _edit(i),
             trailing: IconButton(
@@ -3337,7 +3541,11 @@ class _WizzProfilesPageState extends State<WizzProfilesPage> {
           ),
         const Padding(
           padding: EdgeInsets.all(16),
-          child: Text('Pick a server with the chip under the Remote ID box. It applies to the next '
+          child: Text('Type ID@tag (e.g. 123456789@public) or pick a server with the chip under '
+              'the Remote ID box; it applies to that connection only. Plain IDs use your server. '
+              'Tags are turned into the real server when connecting, so recent PCs show the server '
+              'with a badge. '
+              'The chip applies to the next '
               'connection only; PCs on other servers get a badge in your lists. Only use other '
               'companies\' servers with their permission.'),
         ),
@@ -3548,6 +3756,115 @@ class _WizzMouseSettingsPageState extends State<WizzMouseSettingsPage> {
 
 /// Where the extra keys row is (per session), so the download bar can sit below it.
 final ValueNotifier<MapEntry<Object, Rect>?> wizzKeysRect = ValueNotifier(null);
+
+
+// ---------------------------------------------------------------- keyboard
+const Map<String, String> kWizzKbNames = {
+  'normal': 'Keyboard',
+  'nopred': 'No predictions',
+  'send': 'Keyboard with send',
+};
+
+class WizzKeyboardSettingsPage extends StatefulWidget {
+  const WizzKeyboardSettingsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzKeyboardSettingsPage> createState() => _WizzKeyboardSettingsPageState();
+}
+
+class _WizzKeyboardSettingsPageState extends State<WizzKeyboardSettingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    const subs = {
+      'normal': 'Keys go straight to the PC, with your keyboard\'s suggestions',
+      'nopred': 'Keys go straight to the PC; no suggestions, autocorrect or learning',
+      'send': 'Type or dictate in a box, then send it all at once',
+    };
+    return Scaffold(
+      appBar: AppBar(title: const Text('Keyboard')),
+      body: ListView(children: [
+        const ListTile(
+          title: Text('Tapping the keyboard button opens', style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: Text('Hold the button to pick another; that choice stays for the PC until you disconnect.'),
+        ),
+        for (final e in kWizzKbNames.entries)
+          RadioListTile<String>(
+            title: Text(e.value),
+            subtitle: Text(subs[e.key]!),
+            value: e.key,
+            groupValue: WizzPrefs.kbDefault,
+            onChanged: (v) => setState(() => WizzPrefs.kbDefault = v ?? 'normal'),
+          ),
+        const Divider(),
+        SwitchListTile(
+          title: const Text('Alternative no-predictions method'),
+          subtitle: const Text('Turn on only if "No predictions" shows a locked/secure keyboard. '
+              'Some keyboards then type English letters only.'),
+          value: WizzPrefs.kbNoPredAlt,
+          onChanged: (v) => setState(() => WizzPrefs.kbNoPredAlt = v),
+        ),
+      ]),
+    );
+  }
+}
+
+// ------------------------------------------ extras in the ID/Relay dialog
+class WizzServerDialogExtras extends StatefulWidget {
+  final void Function() close;
+  final TextEditingController idCtrl;
+  final TextEditingController keyCtrl;
+  const WizzServerDialogExtras(
+      {Key? key, required this.close, required this.idCtrl, required this.keyCtrl})
+      : super(key: key);
+  @override
+  State<WizzServerDialogExtras> createState() => _WizzServerDialogExtrasState();
+}
+
+class _WizzServerDialogExtrasState extends State<WizzServerDialogExtras> {
+  late final _tag = TextEditingController(text: WizzPrefs.ownTag);
+  String _err = '';
+
+  void _go(Widget page) {
+    widget.close();
+    globalKey.currentState?.push(MaterialPageRoute(builder: (_) => page));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(
+          controller: _tag,
+          decoration: InputDecoration(
+            labelText: 'Tag for this server (ID@tag)',
+            prefixText: '@',
+            errorText: _err.isEmpty ? null : _err,
+          ),
+          onChanged: (v) {
+            final t = v.trim().toLowerCase();
+            final ok = wizzValidTag(t) && !WizzProfile.all.any((p) => p.tag == t);
+            setState(() => _err = ok ? '' : 'Letters, numbers, dashes; not used by a profile');
+            if (ok) WizzPrefs.ownTag = t;
+          },
+        ),
+        const SizedBox(height: 4),
+        Wrap(spacing: 4, children: [
+          TextButton.icon(
+            icon: const Icon(Icons.bookmark_add_outlined),
+            label: const Text('Save as profile'),
+            onPressed: () => _go(WizzProfilesPage(
+                prefill: WizzProfile('', widget.idCtrl.text.trim(), widget.keyCtrl.text.trim(), Colors.teal))),
+          ),
+          TextButton.icon(
+            icon: const Icon(Icons.dns_outlined),
+            label: const Text('Profiles…'),
+            onPressed: () => _go(const WizzProfilesPage()),
+          ),
+        ]),
+      ]),
+    );
+  }
+}
 '''
 
 
@@ -5906,6 +6223,202 @@ s = rep(s, '                "wizz_take_action" -> {\n', """                "wizz
                     }, 500)
                 }
                 "wizz_take_action" -> {
+""")
+save(p, s)
+
+# ===== Wizz: keyboard modes, send-box fixes, screenshot, toolbar spacing, profile tags in the server dialog =====
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+# keyboard modes: replace the hold menu, add mode handling
+i = s.index("  void _wizzKeyboardMenu() {")
+j = s.index("  void _wizzComposeSend() {", i)
+s = s[:i] + r"""  late String _wizzKbMode = WizzPrefs.kbDefault;
+  bool _wizzComposeSawKb = false;
+
+  Widget _wizzKbIcon() {
+    if (_wizzKbMode == 'normal') return const Icon(Icons.keyboard);
+    return Stack(clipBehavior: Clip.none, children: [
+      const Icon(Icons.keyboard),
+      Positioned(
+        right: -5,
+        bottom: -5,
+        child: Container(
+          padding: const EdgeInsets.all(1.5),
+          decoration: const BoxDecoration(color: Colors.black87, shape: BoxShape.circle),
+          child: Icon(_wizzKbMode == 'send' ? Icons.send : Icons.speaker_notes_off,
+              size: 11, color: Colors.white),
+        ),
+      ),
+    ]);
+  }
+
+  void _wizzOpenKb(String mode) {
+    if (mode == 'send') {
+      setState(() {
+        _showEdit = false;
+        _wizzCompose = true;
+        _wizzComposeSawKb = false;
+      });
+      // the session blocks the soft keyboard; let it type into the box
+      _ffi.invokeMethod("enable_soft_keyboard", true);
+      Future.delayed(const Duration(milliseconds: 250), () {
+        if (mounted) _wizzComposeFocus.requestFocus();
+      });
+    } else {
+      if (_wizzCompose) setState(() => _wizzCompose = false);
+      openKeyboard();
+    }
+  }
+
+  void _wizzKeyboardMenu() {
+    Widget tile(BuildContext ctx, String mode, IconData icon, String title, String sub) =>
+        ListTile(
+          leading: Icon(icon),
+          title: Text(title),
+          subtitle: Text(sub),
+          trailing: _wizzKbMode == mode ? const Icon(Icons.check) : null,
+          onTap: () {
+            Navigator.pop(ctx);
+            setState(() => _wizzKbMode = mode);
+            _wizzOpenKb(mode);
+          },
+        );
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const ListTile(
+            title: Text('Keyboard', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text('Your choice stays for this PC until you disconnect'),
+          ),
+          tile(ctx, 'normal', Icons.keyboard, 'Keyboard', 'Keys go straight to the PC'),
+          tile(ctx, 'nopred', Icons.speaker_notes_off, 'Keyboard, no predictions',
+              'No suggestions, autocorrect or learning'),
+          tile(ctx, 'send', Icons.send, 'Keyboard with send',
+              'Type or dictate with autocorrect, then send it all at once'),
+        ]),
+      ),
+    );
+  }
+
+""" + s[j:]
+s = rep(s, """                                  icon: Icon(Icons.keyboard),
+                                  onPressed: () {
+                                    if (_wizzCompose) setState(() => _wizzCompose = false);
+                                    openKeyboard();
+                                  }))),""", """                                  icon: _wizzKbIcon(),
+                                  onPressed: () => _wizzOpenKb(_wizzKbMode)))),""", count=2)
+# no-predictions mode on the direct keyboard field
+s = rep(s, """                      textInputAction: TextInputAction.newline,
+                      autocorrect: false,""", """                      textInputAction: TextInputAction.newline,
+                      autocorrect: false,
+                      enableSuggestions: _wizzKbMode != 'nopred',
+                      enableIMEPersonalizedLearning: _wizzKbMode != 'nopred',""")
+s = rep(s, """                      // trick way to make backspace work always
+                      keyboardType: TextInputType.multiline,""", """                      // trick way to make backspace work always
+                      keyboardType: _wizzKbMode == 'nopred' && WizzPrefs.kbNoPredAlt
+                          ? TextInputType.visiblePassword
+                          : TextInputType.multiline,""")
+# send box closes with the keyboard (text is kept for next time)
+s = rep(s, """    if (!widget.active) return;
+    if (!visible) {
+""", """    if (!widget.active) return;
+    if (!visible) {
+      if (_wizzCompose && _wizzComposeSawKb) {
+        _wizzCompose = false;
+        _wizzComposeSawKb = false;
+        _wizzComposeFocus.unfocus();
+        _physicalFocusNode.requestFocus();
+      }
+""")
+s = rep(s, """    } else {
+      _iosKeyboardWorkaroundTimer?.cancel();
+      _iosKeyboardWorkaroundTimer = null;""", """    } else {
+      if (_wizzCompose) _wizzComposeSawKb = true;
+      _iosKeyboardWorkaroundTimer?.cancel();
+      _iosKeyboardWorkaroundTimer = null;""")
+s = rep(s, """                _wizzComposeFocus.unfocus();
+                setState(() => _wizzCompose = false);""", """                _wizzComposeFocus.unfocus();
+                setState(() => _wizzCompose = false);
+                _physicalFocusNode.requestFocus();""")
+# screenshot: toolbar button + flash
+s = rep(s, """                    wizzTb('minimize', IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.minimize),
+                      onPressed: wizzMinimize,
+                    )),
+""", """                    wizzTb('minimize', IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.minimize),
+                      onPressed: wizzMinimize,
+                    )),
+                    wizzTb('shot', IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.photo_camera_outlined),
+                      onPressed: () => wizzScreenshot(_ffi),
+                    )),
+""")
+s = rep(s, "            if (widget.active && _wizzCompose) _wizzComposeBar(),\n",
+        "            if (widget.active && _wizzCompose) _wizzComposeBar(),\n            if (widget.active) const WizzFlash(),\n")
+# toolbar: buttons spread evenly; the collapse arrow gets a backdrop too
+s = rep(s, """            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Row(
+              children: wizzArrange(""", """            child: LayoutBuilder(builder: (context, wizzCons) => FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.center,
+              child: ConstrainedBox(
+              constraints: BoxConstraints(minWidth: wizzCons.maxWidth),
+              child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: wizzArrange(""")
+s = rep(s, """                  ])),
+            ),
+          ),
+          Obx(() => IconButton(
+                color: Colors.white,
+                icon: Icon(Icons.expand_more),""", """                  ])))),
+            ),
+          ),
+          Obx(() => wizzFrostIf(IconButton(
+                color: Colors.white,
+                icon: Icon(Icons.expand_more),""")
+s = rep(s, "              )),\n        ],\n      )),\n    );\n  }\n\n  bool get showCursorPaint",
+        "              ))),\n        ],\n      )),\n    );\n  }\n\n  bool get showCursorPaint")
+save(p, s)
+
+# ID/Relay dialog: tag for your server, save as profile, profiles…
+p = 'flutter/lib/mobile/widgets/dialog.dart'
+s = load(p)
+s = rep(s, "import '../../common.dart';\n", "import '../../common.dart';\nimport '../pages/wizz_settings.dart' show WizzServerDialogExtras;\n")
+s = rep(s, """                  buildField('Key', keyCtrl, ''),
+                  if (isInProgress)""", """                  buildField('Key', keyCtrl, ''),
+                  if (isAndroid)
+                    WizzServerDialogExtras(
+                        close: () => close(), idCtrl: idCtrl, keyCtrl: keyCtrl),
+                  if (isInProgress)""")
+save(p, s)
+
+# screenshots: own notification id, show in the gallery
+p = kt + 'WizzFiles.kt'
+s = load(p)
+s = rep(s, "            b.setContentIntent(PendingIntent.getActivity(ctx, 7302, target, flags))",
+        "            b.setContentIntent(PendingIntent.getActivity(ctx, call.argument<Int>(\"nid\") ?: 7302, target, flags))")
+s = rep(s, "            nm.notify(7302, b.build())", "            nm.notify(call.argument<Int>(\"nid\") ?: 7302, b.build())")
+save(p, s)
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, '                "wizz_speech" -> {\n', """                "wizz_media_scan" -> {
+                    try {
+                        android.media.MediaScannerConnection.scanFile(this,
+                            arrayOf(call.arguments as String), arrayOf("image/png"), null)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "media scan: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_speech" -> {
 """)
 save(p, s)
 
