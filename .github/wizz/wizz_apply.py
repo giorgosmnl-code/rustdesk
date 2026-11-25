@@ -3727,6 +3727,19 @@ Future<Map<String, dynamic>> wizzBackupBuild() async {
   try {
     fav = (await bind.mainGetFav()).toList();
   } catch (_) {}
+  // the PC list (newest first): ID, name and platform, no passwords
+  final peers = <Map<String, String>>[];
+  try {
+    final l = jsonDecode(await bind.mainLoadRecentPeersForAb(filter: '')) as List;
+    for (final p in l) {
+      final m = Map<String, dynamic>.from(p as Map);
+      if ((m['id'] ?? '').toString().isEmpty) continue;
+      peers.add({
+        for (final k in const ['id', 'alias', 'platform', 'hostname', 'username'])
+          k: (m[k] ?? '').toString()
+      });
+    }
+  } catch (_) {}
   return {
     'app': 'rustdesk-multiview',
     'v': 1,
@@ -3734,6 +3747,7 @@ Future<Map<String, dynamic>> wizzBackupBuild() async {
     'main': main,
     'local': local,
     'fav': fav,
+    'peers': peers,
   };
 }
 
@@ -3763,6 +3777,7 @@ String _wizzBackupSummary(Map<String, dynamic> b) {
     skins = (jsonDecode(local['wizz-skins'] ?? '[]') as List).length;
   } catch (_) {}
   final fav = (b['fav'] as List?)?.length ?? 0;
+  final pcs = (b['peers'] as List?)?.length ?? 0;
   final id = main['custom-rendezvous-server'] ?? '';
   final created = (b['created'] ?? '').toString();
   return [
@@ -3772,6 +3787,7 @@ String _wizzBackupSummary(Map<String, dynamic> b) {
     if ((main['api-server'] ?? '').isNotEmpty) 'API: ${main['api-server']}',
     'Server profiles: $profiles',
     'Saved skins: $skins',
+    'PCs (connections): $pcs',
     'Favourite PCs: $fav',
     '${local.length + main.length} settings in total',
   ].join('\n');
@@ -3800,6 +3816,20 @@ Future<void> wizzBackupApply(Map<String, dynamic> b) async {
         if (!cur.contains(id)) cur.add(id);
       }
       await bind.mainStoreFav(favs: cur);
+    } catch (_) {}
+  }
+  final peers = (b['peers'] as List?) ?? const [];
+  // oldest first, so the newest ends up on top of the recent list
+  for (final p in peers.reversed) {
+    try {
+      final m = Map<String, dynamic>.from(p as Map);
+      final id = (m['id'] ?? '').toString();
+      if (id.isEmpty) continue;
+      final alias = (m['alias'] ?? '').toString();
+      final exists = await bind.mainPeerExists(id: id);
+      if (!exists || alias.isNotEmpty) {
+        await bind.mainSetPeerOption(id: id, key: 'alias', value: alias);
+      }
     } catch (_) {}
   }
 }
@@ -3866,7 +3896,7 @@ class _WizzBackupPageState extends State<WizzBackupPage> {
         title: const Text('Restore these settings?'),
         content: SingleChildScrollView(
           child: Text('${_wizzBackupSummary(b)}\n\n'
-              'Your current settings will be replaced. Favourites are added to yours. '
+              'Your current settings will be replaced. PCs and favourites are added to yours. '
               'App lock and PIN stay as they are. The app restarts afterwards.'),
         ),
         actions: [
@@ -3915,7 +3945,7 @@ class _WizzBackupPageState extends State<WizzBackupPage> {
           child: Text('Back up', style: TextStyle(fontWeight: FontWeight.bold)),
         ),
         tile(Icons.save_alt, 'Save & share file',
-            'ID/Relay/API server and key, server profiles, skins, toolbar, keys, keyboard, mouse, home tabs, file settings, favourites',
+            'ID/Relay/API server and key, your PC list with names, favourites, server profiles, skins, toolbar, keys, keyboard, mouse, home tabs, file settings',
             _saveShare),
         tile(Icons.copy, 'Copy as text', 'Paste it into a note or chat to keep it', _copyText),
         const Divider(),
@@ -7732,47 +7762,7 @@ save(p, s)
 # ---------------------------------------------------------- remote page
 p = 'flutter/lib/mobile/pages/remote_page.dart'
 s = load(p)
-# dynamic toolbar
-s = rep(s, """      child: Row(
-        mainAxisSize: MainAxisSize.max,
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: <Widget>[
-          Expanded(
-            child: LayoutBuilder(builder: (context, wizzCons) => FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.center,
-              child: ConstrainedBox(
-              constraints: BoxConstraints(minWidth: wizzCons.maxWidth),
-              child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: wizzArrange(context, () {""", """      child: LayoutBuilder(
-          builder: (context, wizzCons) => wizzToolbarRow(
-              context,
-              wizzCons.maxWidth,
-              Obx(() => IconButton(
-                    color: Colors.white,
-                    icon: Icon(Icons.expand_more),
-                    onPressed: _ffi.ffiModel.waitForFirstImage.isTrue
-                        ? null
-                        : () {
-                            setState(() => _showBar = !_showBar);
-                          },
-                  )), () {""")
-s = rep(s, """                  ])))),
-            ),
-          ),
-          Obx(() => wizzFrostIf(IconButton(
-                color: Colors.white,
-                icon: Icon(Icons.expand_more),
-                onPressed: _ffi.ffiModel.waitForFirstImage.isTrue
-                    ? null
-                    : () {
-                        setState(() => _showBar = !_showBar);
-                      },
-              ))),
-        ],
-      )),""", """                  ])),
-      ),""")
+# (dynamic toolbar reverted in #21: the old even-spaced row stays)
 s = rep(s, "                      icon: const Icon(Icons.minimize),\n", "                      icon: const Icon(Icons.remove),\n")
 s = rep(s, """      Positioned(
         right: -5,
