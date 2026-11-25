@@ -6968,8 +6968,11 @@ s = rep(s, "  static set kbNoPredAlt(bool v) => _set('kb-nopred-alt', v ? 'Y' : 
 """)
 s = rep(s, "  'win': WizzKey('Win', (f, m) => f.inputModel.command = !f.inputModel.command, modifier: true),\n",
         """  'win': WizzKey('Win', (f, m) {
-    f.inputModel.command = false;
-    f.inputModel.inputKey('Meta');
+    if (f.inputModel.command) {
+      f.inputModel.command = false;
+    } else {
+      f.inputModel.inputKey('Meta');
+    }
   }, modifier: true),
   'hold': WizzKey('Hold', (f, m) => wizzToggleHold(f), modifier: true),
   'paste': WizzKey('Paste', (f, m) => wizzPasteClipboard(f), icon: Icons.content_paste),
@@ -7860,8 +7863,11 @@ s = rep(s, """      wrap(isMac ? ' Cmd ' : ' Win ', () {
         setState(() => inputModel.command = !inputModel.command);
       }, active: inputModel.command),""", """      wrap(isMac ? ' Cmd ' : ' Win ', () {
         setState(() {
-          inputModel.command = false;
-          inputModel.inputKey('Meta');
+          if (inputModel.command) {
+            inputModel.command = false;
+          } else {
+            inputModel.inputKey('Meta');
+          }
         });
       }, active: inputModel.command, onLongPress: () {
         setState(() => inputModel.command = !inputModel.command);
@@ -7972,6 +7978,235 @@ s = rep(s, '                "wizz_keepalive" -> {\n', """                "wizz_k
                     }, 400)
                 }
                 "wizz_keepalive" -> {
+""")
+save(p, s)
+
+
+# ===== Wizz #23: start-up PCs (connect on a fresh start) =====
+p = 'flutter/lib/mobile/pages/wizz_settings.dart'
+s = load(p)
+s = rep(s, "  /// Minutes in the background before the app closes itself (0 = never).\n",
+        r"""  /// PCs opened automatically when the app starts fresh (first = shown).
+  static List<String> get startupPcs =>
+      _get('startup-pcs', '').split(',').where((e) => e.isNotEmpty).toList();
+  static set startupPcs(List<String> v) => _set('startup-pcs', v.join(','));
+  static bool isStartupPc(String id) => startupPcs.contains(id);
+  static void setStartupPc(String id, bool on) {
+    final l = startupPcs..remove(id);
+    if (on) l.add(id);
+    startupPcs = l;
+  }
+
+  /// Minutes in the background before the app closes itself (0 = never).
+""")
+s = rep(s, "  'kb-nopred-method', 'drag-on', 'drag-ms', 'drag-px', 'realkeys', 'auto-close',\n",
+        "  'kb-nopred-method', 'drag-on', 'drag-ms', 'drag-px', 'realkeys', 'auto-close',\n  'startup-pcs',\n")
+s = rep(s, """    SettingsTile(
+      title: const Text('Auto-close in background'),""", """    SettingsTile(
+      title: const Text('Start-up PCs'),
+      value: Text(WizzPrefs.startupPcs.isEmpty
+          ? 'None: set them in a PC\\'s ⋮ menu'
+          : '${WizzPrefs.startupPcs.length} PC(s) open when the app starts'),
+      leading: const Icon(Icons.rocket_launch_outlined),
+      onPressed: (c) => Navigator.push(
+          c, MaterialPageRoute(builder: (_) => const WizzStartupPcsPage())),
+    ),
+    SettingsTile(
+      title: const Text('Auto-close in background'),""")
+s += r"""
+
+// ------------------------------------------------------- start-up PCs
+class WizzStartupPcsPage extends StatefulWidget {
+  const WizzStartupPcsPage({Key? key}) : super(key: key);
+  @override
+  State<WizzStartupPcsPage> createState() => _WizzStartupPcsPageState();
+}
+
+class _WizzStartupPcsPageState extends State<WizzStartupPcsPage> {
+  late List<String> _ids = WizzPrefs.startupPcs;
+
+  String _name(String id) {
+    try {
+      final a = bind.mainGetPeerOptionSync(id: id, key: 'alias');
+      if (a.isNotEmpty) return a;
+    } catch (_) {}
+    return id;
+  }
+
+  void _save() => WizzPrefs.startupPcs = _ids;
+
+  Future<void> _add() async {
+    final recent = gFFI.recentPeersModel.peers
+        .map((p) => p.id)
+        .where((id) => !_ids.contains(id))
+        .toList();
+    final picked = <String>{};
+    final ctrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, set) => AlertDialog(
+          title: const Text('Add start-up PCs'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(
+                controller: ctrl,
+                decoration: const InputDecoration(
+                    labelText: 'ID (or several, separated by commas)'),
+              ),
+              const SizedBox(height: 8),
+              if (recent.isNotEmpty)
+                Flexible(
+                  child: ListView(shrinkWrap: true, children: [
+                    for (final id in recent)
+                      CheckboxListTile(
+                        dense: true,
+                        value: picked.contains(id),
+                        title: Text(_name(id)),
+                        subtitle: _name(id) == id ? null : Text(id),
+                        onChanged: (v) => set(() {
+                          if (v == true) {
+                            picked.add(id);
+                          } else {
+                            picked.remove(id);
+                          }
+                        }),
+                      ),
+                  ]),
+                ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
+    final typed = ctrl.text
+        .split(',')
+        .map((e) => e.replaceAll(' ', '').trim())
+        .where((e) => e.isNotEmpty);
+    setState(() {
+      for (final id in [...picked, ...typed]) {
+        if (!_ids.contains(id)) _ids.add(id);
+      }
+      _save();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Start-up PCs')),
+      floatingActionButton: FloatingActionButton.extended(
+        icon: const Icon(Icons.add),
+        label: const Text('Add PC'),
+        onPressed: _add,
+      ),
+      body: Column(children: [
+        const ListTile(
+          subtitle: Text('These PCs connect by themselves when the app starts fresh '
+              '(after auto-close, a reboot or closing it). The first one is shown; '
+              'drag to reorder. Add them here or from a PC\'s ⋮ menu on the home screen.'),
+        ),
+        Expanded(
+          child: _ids.isEmpty
+              ? const Center(child: Text('No start-up PCs yet'))
+              : ReorderableListView(
+                  onReorder: (a, b) => setState(() {
+                    if (b > a) b--;
+                    final id = _ids.removeAt(a);
+                    _ids.insert(b, id);
+                    _save();
+                  }),
+                  children: [
+                    for (var i = 0; i < _ids.length; i++)
+                      ListTile(
+                        key: ValueKey('sp-${_ids[i]}'),
+                        leading: CircleAvatar(radius: 14, child: Text('${i + 1}')),
+                        title: Text(_name(_ids[i])),
+                        subtitle: _name(_ids[i]) == _ids[i] ? null : Text(_ids[i]),
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            tooltip: 'Remove',
+                            onPressed: () => setState(() {
+                              _ids.removeAt(i);
+                              _save();
+                            }),
+                          ),
+                          const Icon(Icons.drag_handle),
+                        ]),
+                      ),
+                  ],
+                ),
+        ),
+      ]),
+    );
+  }
+}
+"""
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/wizz_switcher.dart'
+s = load(p)
+s += r"""
+
+// ------------------------------------------- start-up PCs on a fresh start
+bool _wizzStartupDone = false;
+
+/// Opens the start-up PCs once per app start (after the app lock).
+void wizzStartupConnect(BuildContext? Function() ctx) {
+  if (_wizzStartupDone) return;
+  _wizzStartupDone = true;
+  final ids = WizzPrefs.startupPcs;
+  if (ids.isEmpty) return;
+  WizzLock.to.afterUnlock(() {
+    final c = ctx();
+    if (c == null || WizzSessions.to.hostMounted) return;
+    wizzConnectMany(c, ids);
+  });
+}
+"""
+save(p, s)
+
+p = 'flutter/lib/mobile/pages/home_page.dart'
+s = load(p)
+s = rep(s, "    initPages();\n    WizzLock.to.start();\n",
+        "    initPages();\n    WizzLock.to.start();\n    if (!widget.wizzMini) {\n      WidgetsBinding.instance.addPostFrameCallback(\n          (_) => wizzStartupConnect(() => mounted ? context : null));\n    }\n")
+save(p, s)
+
+p = 'flutter/lib/common/widgets/peer_card.dart'
+s = load(p)
+s = rep(s, "import '../../mobile/pages/wizz_settings.dart' show WizzPrefs, wizzRealKeys;\n",
+        "import '../../mobile/pages/wizz_settings.dart' show WizzPrefs, wizzRealKeys;\n")
+s = rep(s, """        padding: menuPadding,
+        dismissOnClicked: true,
+      ));
+    }
+""", """        padding: menuPadding,
+        dismissOnClicked: true,
+      ));
+      menuItems.add(MenuEntryButton<String>(
+        childBuilder: (TextStyle? style) => Text(
+            WizzPrefs.isStartupPc(peer.id)
+                ? 'Open on app start ✓'
+                : 'Open on app start',
+            style: style),
+        proc: () {
+          final on = !WizzPrefs.isStartupPc(peer.id);
+          WizzPrefs.setStartupPc(peer.id, on);
+          showToast(on
+              ? 'Opens when the app starts'
+              : 'No longer opens on start');
+        },
+        padding: menuPadding,
+        dismissOnClicked: true,
+      ));
+    }
 """)
 save(p, s)
 
