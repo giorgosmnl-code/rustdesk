@@ -6,6 +6,8 @@ on:
     - master
     paths:
     - .github/wizz/wizz_apply.py
+    - .github/wizz/wizz_rust.py
+    - .github/workflows/wizz-android.yml
   workflow_dispatch:
     inputs:
       variant:
