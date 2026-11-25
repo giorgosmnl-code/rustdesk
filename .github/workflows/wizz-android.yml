@@ -1,6 +1,11 @@
 name: Wizz Android APK
-run-name: ${{ inputs.variant }} APK
+run-name: ${{ inputs.variant || 'multiview' }} APK
 on:
+  push:
+    branches:
+    - master
+    paths:
+    - .github/wizz/wizz_apply.py
   workflow_dispatch:
     inputs:
       variant:
@@ -11,6 +16,7 @@ on:
         - wizz
         default: multiview
 env:
+  VARIANT: ${{ inputs.variant || 'multiview' }}
   RUST_VERSION: '1.75'
   CARGO_NDK_VERSION: 3.1.2
   ANDROID_FLUTTER_VERSION: 3.24.5
@@ -52,6 +58,9 @@ jobs:
     - generate-bridge
     if: ${{ !cancelled() && needs.check.result == 'success' && (needs.generate-bridge.result == 'success' || needs.generate-bridge.result == 'skipped') }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
     steps:
     - name: Free Disk Space (Ubuntu)
       uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
@@ -109,7 +118,7 @@ jobs:
     - name: Apply Wizz changes (zoom limit, multi-session, app id)
       shell: bash
       env:
-        WIZZ_VARIANT: ${{ inputs.variant }}
+        WIZZ_VARIANT: ${{ env.VARIANT }}
       run: |
         if [ "$WIZZ_VARIANT" = "wizz" ]; then
           APPID=com.wizz.rustdesk; LABEL="RustDesk Wizz"; export WIZZ_MULTI=0
@@ -236,9 +245,22 @@ jobs:
         cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
         cd flutter
         flutter build apk --release --target-platform android-arm64 --split-per-abi
-        mkdir -p ../out && cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../out/rustdesk-${{ inputs.variant }}-${{ env.VERSION }}-arm64.apk
+        mkdir -p ../out && cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../out/rustdesk-${{ env.VARIANT }}-${{ env.VERSION }}-arm64.apk
     - name: Upload APK
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: rustdesk-${{ inputs.variant }}-apk
+        name: rustdesk-${{ env.VARIANT }}-apk
         path: out/*.apk
+    - name: Publish APK to the apk branch
+      shell: bash
+      run: |
+        set -e
+        mkdir -p ../pub && cp out/*.apk ../pub/rustdesk-${{ env.VARIANT }}.apk
+        cd ../pub
+        sha256sum rustdesk-${{ env.VARIANT }}.apk > rustdesk-${{ env.VARIANT }}.apk.sha256
+        git init -q -b apk-${{ env.VARIANT }}
+        git config user.name "github-actions"
+        git config user.email "github-actions@users.noreply.github.com"
+        git add .
+        git commit -qm "${{ env.VARIANT }} APK from ${{ github.sha }} (run ${{ github.run_id }})"
+        git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:apk-${{ env.VARIANT }}
