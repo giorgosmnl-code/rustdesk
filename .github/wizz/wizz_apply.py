@@ -7650,27 +7650,69 @@ class _WizzKbFanState extends State<WizzKbFan> {
 
   @override
   void dispose() {
+    _holdT?.cancel();
     _e?.remove();
     _e = null;
     super.dispose();
   }
 
+  // AnyDesk-style: the fan opens as soon as the finger starts to slide, or
+  // after a short hold; a quick tap is a normal tap.
+  Timer? _holdT;
+  bool _opened = false;
+  Offset _down = Offset.zero;
+
+  void _cancelHold() {
+    _holdT?.cancel();
+    _holdT = null;
+  }
+
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onLongPressStart: (d) => _open(d.globalPosition),
-      onLongPressMoveUpdate: (d) => _move(d.globalPosition),
-      onLongPressEnd: (_) => _end(),
-      child: IconButton(
-        color: Colors.white,
-        icon: widget.icon,
-        onPressed: () {
-          if (_e != null) {
-            _close();
-            return;
-          }
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (e) {
+        _down = e.position;
+        _opened = false;
+        _cancelHold();
+        _holdT = Timer(const Duration(milliseconds: 170), () {
+          _holdT = null;
+          if (!mounted || _opened) return;
+          _opened = true;
+          _open(_down);
+        });
+      },
+      onPointerMove: (e) {
+        if (!_opened && (e.position - _down).distance > 8) {
+          _cancelHold();
+          _opened = true;
+          _open(_down);
+        }
+        if (_opened) _move(e.position);
+      },
+      onPointerUp: (e) {
+        _cancelHold();
+        if (_opened) {
+          _end();
+        } else {
           widget.onTap();
-        },
+        }
+        _opened = false;
+      },
+      onPointerCancel: (_) {
+        _cancelHold();
+        if (_opened && !_sticky) _close();
+        _opened = false;
+      },
+      child: SizedBox(
+        width: 48,
+        height: 48,
+        child: Center(
+          child: IconTheme.merge(
+            data: const IconThemeData(color: Colors.white),
+            child: widget.icon,
+          ),
+        ),
       ),
     );
   }
