@@ -165,7 +165,7 @@ class WizzSessions {
   void closeAt(int i) {
     if (i < 0 || i >= sessions.length) return;
     if (sessions.length == 1) {
-      wizzPopToHome();
+      wizzCloseAll();
       return;
     }
     final cur = current.value;
@@ -362,6 +362,21 @@ Future<void> wizzPickPhoneFiles() async {
 Future<void> wizzTakeSharedFiles() async {
   final r = await gFFI.invokeMethodWithResult<List<dynamic>>('wizz_take_shared');
   wizzSendPhoneFiles((r ?? []).map((e) => e.toString()).toList());
+}
+
+/// Disconnect every PC right away, then go back home. Closing the sessions
+/// first (instead of waiting for the remote screen to be disposed after its
+/// pop animation) means nothing is left half-open when this runs from the
+/// notification or while the app is coming back from the background.
+void wizzCloseAll() {
+  final m = WizzSessions.to;
+  for (final s in m.sessions) {
+    bind.sessionClose(sessionId: s.ffi.sessionId);
+  }
+  m.clear();
+  wizzResetMinimized();
+  gFFI.invokeMethod("enable_soft_keyboard", true);
+  if (m.hostMounted) wizzPopToHome();
 }
 
 /// Original mobile behaviour of closeConnection(): back to the home page.
@@ -1169,7 +1184,7 @@ Future<void> wizzTakeNotificationAction() async {
     if (a == 'return') {
       wizzReturnToSessions();
     } else if (a == 'closeall') {
-      wizzPopToHome();
+      wizzCloseAll();
     }
   });
 }
@@ -1201,7 +1216,7 @@ void wizzCloseTapped(BuildContext context, void Function() closeOne) {
               style: const TextStyle(color: Colors.redAccent)),
           onTap: () {
             Navigator.pop(ctx);
-            wizzPopToHome();
+            wizzCloseAll();
           },
         ),
       ]),
@@ -1339,7 +1354,7 @@ Future<void> wizzConfirmDisconnectAll([BuildContext? context]) async {
       ],
     ),
   );
-  if (ok == true && WizzSessions.to.hostMounted) wizzPopToHome();
+  if (ok == true && WizzSessions.to.hostMounted) wizzCloseAll();
 }
 
 void _wizzMoreSheet(BuildContext context, List<MapEntry<String, Widget>> hidden,
@@ -1385,7 +1400,7 @@ void _wizzMoreSheet(BuildContext context, List<MapEntry<String, Widget>> hidden,
                     style: white),
                 onTap: () {
                   Navigator.pop(ctx);
-                  wizzPopToHome();
+                  wizzCloseAll();
                 },
               ),
             ListTile(
@@ -1434,12 +1449,14 @@ Widget wizzPeerTile(String id, double size, Widget fallback) {
       height: size,
       decoration: BoxDecoration(
         color: Colors.black,
-        borderRadius: BorderRadius.circular(8),
+        // same corner radius as the PC card's colour square (5), so none of
+        // that colour peeks out around the live picture
+        borderRadius: BorderRadius.circular(5),
         border: Border.all(
             color: dropped ? Colors.red : Colors.greenAccent, width: 2),
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(3),
         child: Stack(fit: StackFit.expand, children: [
           CustomPaint(painter: WizzPreviewPainter(s.ffi.imageModel)),
           if (dropped)
@@ -6848,6 +6865,1081 @@ s = rep(s, '                "wizz_media_scan" -> {\n', """                "wizz_
                     result.success(true)
                 }
                 "wizz_media_scan" -> {
+""")
+save(p, s)
+
+
+# ===== Wizz #20: keyboard fan, dynamic toolbar, Win tap, drag gesture settings,
+# no-predictions methods + Paste key, real key presses per PC, background auto-close =====
+import re as _re20
+
+# ---------------------------------------------------------------- settings
+p = 'flutter/lib/mobile/pages/wizz_settings.dart'
+s = load(p)
+s = rep(s, "import 'wizz_switcher.dart' show wizzScreenshot, wizzKbOn, wizzKbRestore;",
+        "import 'wizz_switcher.dart' show wizzScreenshot, wizzKbOn, wizzKbRestore, wizzToast;\nimport '../../models/input_model.dart' show MouseButtons;")
+s = rep(s, "  static set kbNoPredAlt(bool v) => _set('kb-nopred-alt', v ? 'Y' : 'N');\n",
+        r"""  static set kbNoPredAlt(bool v) => _set('kb-nopred-alt', v ? 'Y' : 'N');
+
+  /// How "no predictions" asks the keyboard: 'incognito' | 'password' | 'plain'.
+  static String get kbNoPredMethod {
+    final v = _get('kb-nopred-method', '');
+    if (v == 'incognito' || v == 'password' || v == 'plain') return v;
+    return kbNoPredAlt ? 'password' : 'incognito';
+  }
+
+  static set kbNoPredMethod(String v) => _set('kb-nopred-method', v);
+
+  // tap-then-drag in mouse mode
+  static bool? _dragOn;
+  static int? _dragMs;
+  static int? _dragPx;
+  static bool get dragOn => _dragOn ??= _get('drag-on', 'Y') == 'Y';
+  static set dragOn(bool v) {
+    _dragOn = v;
+    _set('drag-on', v ? 'Y' : 'N');
+  }
+
+  static int get dragMs =>
+      _dragMs ??= (int.tryParse(_get('drag-ms', '180')) ?? 180).clamp(100, 400);
+  static set dragMs(int v) {
+    _dragMs = v.clamp(100, 400);
+    _set('drag-ms', '$_dragMs');
+  }
+
+  static int get dragPx =>
+      _dragPx ??= (int.tryParse(_get('drag-px', '30')) ?? 30).clamp(10, 100);
+  static set dragPx(int v) {
+    _dragPx = v.clamp(10, 100);
+    _set('drag-px', '$_dragPx');
+  }
+
+  static Duration get dragTimeout =>
+      dragOn ? Duration(milliseconds: dragMs) : const Duration(milliseconds: 1);
+  static double get dragSlop => dragPx.toDouble();
+
+  // PCs that get real key presses instead of text
+  static Set<String>? _realKeys;
+  static Set<String> get realKeys => _realKeys ??=
+      _get('realkeys', '').split(',').where((e) => e.isNotEmpty).toSet();
+  static void setRealKeys(String id, bool on) {
+    final s = realKeys;
+    if (on) {
+      s.add(id);
+    } else {
+      s.remove(id);
+    }
+    _set('realkeys', s.join(','));
+  }
+
+  /// Minutes in the background before the app closes itself (0 = never).
+  static int get autoCloseMin => int.tryParse(_get('auto-close', '15')) ?? 15;
+  static set autoCloseMin(int v) => _set('auto-close', '$v');
+""")
+s = rep(s, "  'win': WizzKey('Win', (f, m) => f.inputModel.command = !f.inputModel.command, modifier: true),\n",
+        """  'win': WizzKey('Win', (f, m) {
+    f.inputModel.command = false;
+    f.inputModel.inputKey('Meta');
+  }, modifier: true),
+  'hold': WizzKey('Hold', (f, m) => wizzToggleHold(f), modifier: true),
+  'paste': WizzKey('Paste', (f, m) => wizzPasteClipboard(f), icon: Icons.content_paste),
+""")
+s = rep(s, "  'own-tag', 'skin', 'skins', 'profiles', 'privacy-mode', 'lock-after',\n",
+        "  'own-tag', 'skin', 'skins', 'profiles', 'privacy-mode', 'lock-after',\n  'kb-nopred-method', 'drag-on', 'drag-ms', 'drag-px', 'realkeys', 'auto-close',\n")
+s = rep(s, """      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzBackupPage())),
+    ),
+""", """      onPressed: (c) => Navigator.push(c, MaterialPageRoute(builder: (_) => const WizzBackupPage())),
+    ),
+    SettingsTile(
+      title: const Text('Auto-close in background'),
+      value: Text(WizzPrefs.autoCloseMin == 0
+          ? 'Off'
+          : 'Closes the app after ${WizzPrefs.autoCloseMin} min in the background'),
+      leading: const Icon(Icons.timer_off_outlined),
+      onPressed: (c) => wizzPickAutoClose(c),
+    ),
+""")
+# keyboard page: three no-predictions methods instead of one switch
+s = rep(s, """        SwitchListTile(
+          title: const Text('Alternative no-predictions method'),
+          subtitle: const Text('Password-type field without the incognito sign. '
+              'Some keyboards then limit languages or layouts.'),
+          value: WizzPrefs.kbNoPredAlt,
+          onChanged: (v) => setState(() => WizzPrefs.kbNoPredAlt = v),
+        ),
+""", """        const ListTile(
+          title: Text('How "No predictions" asks your keyboard',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          subtitle: Text('Keyboards treat these differently: try them and keep the one that works.'),
+        ),
+        for (final e in const [
+          ['incognito', 'Incognito', 'No suggestions, nothing learned. Some keyboards (SwiftKey) turn off their clipboard.'],
+          ['password', 'Password-type field', 'No incognito sign. Keyboards may limit languages and their clipboard.'],
+          ['plain', 'Plain (AnyDesk-style)', 'Just asks for no suggestions or autocorrect. Keeps the keyboard clipboard; some keyboards may still suggest.'],
+        ])
+          RadioListTile<String>(
+            title: Text(e[1]),
+            subtitle: Text(e[2]),
+            value: e[0],
+            groupValue: WizzPrefs.kbNoPredMethod,
+            onChanged: (v) => setState(() => WizzPrefs.kbNoPredMethod = v ?? 'incognito'),
+          ),
+        const ListTile(
+          dense: true,
+          subtitle: Text('Paste always works with the "Paste" extra key, whatever the keyboard does.'),
+        ),
+""")
+# mouse page: drag gesture section
+s = rep(s, """        const SizedBox(height: 12),
+        TextButton(
+            onPressed: () => setState(() {
+                  WizzPrefs.mouseSpeed = 1.0;
+                  WizzPrefs.mouseAccel = 0;
+                }),
+            child: const Text('Reset (1.0×, no acceleration)')),
+""", """        const SizedBox(height: 12),
+        TextButton(
+            onPressed: () => setState(() {
+                  WizzPrefs.mouseSpeed = 1.0;
+                  WizzPrefs.mouseAccel = 0;
+                }),
+            child: const Text('Reset (1.0×, no acceleration)')),
+        const Divider(height: 32),
+        const Text('Drag gesture', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('Tap, then quickly touch again and move: that holds the left button and drags. '
+            'Long press stays right click.'),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, children: [
+          ChoiceChip(
+            label: const Text('Double-tap and drag'),
+            selected: WizzPrefs.dragOn,
+            onSelected: (_) => setState(() => WizzPrefs.dragOn = true),
+          ),
+          ChoiceChip(
+            label: const Text('Off (Hold key only)'),
+            selected: !WizzPrefs.dragOn,
+            onSelected: (_) => setState(() => WizzPrefs.dragOn = false),
+          ),
+        ]),
+        if (WizzPrefs.dragOn) ...[
+          const SizedBox(height: 12),
+          Text('Double-tap window: ${WizzPrefs.dragMs} ms',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          const Text('How quickly the second touch must follow the tap. Lower = fewer accidental drags.'),
+          Slider(
+            value: WizzPrefs.dragMs.toDouble(),
+            min: 100,
+            max: 400,
+            divisions: 30,
+            label: '${WizzPrefs.dragMs} ms',
+            onChanged: (v) => setState(() => WizzPrefs.dragMs = v.round()),
+          ),
+          Text('Double-tap distance: ${WizzPrefs.dragPx} px',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          const Text('How close the second touch must land to the first.'),
+          Slider(
+            value: WizzPrefs.dragPx.toDouble(),
+            min: 10,
+            max: 100,
+            divisions: 18,
+            label: '${WizzPrefs.dragPx} px',
+            onChanged: (v) => setState(() => WizzPrefs.dragPx = v.round()),
+          ),
+        ] else
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('Add the "Hold" key to your extra keys: tap it to hold the left button, '
+                'move, tap it again to let go.'),
+          ),
+        const SizedBox(height: 8),
+        const Text('Try it here', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        const _WizzDragTest(),
+        TextButton(
+            onPressed: () => setState(() {
+                  WizzPrefs.dragOn = true;
+                  WizzPrefs.dragMs = 180;
+                  WizzPrefs.dragPx = 30;
+                }),
+            child: const Text('Reset drag (180 ms, 30 px)')),
+""")
+s += r"""
+
+// ---------------------------------------------------------- drag test box
+class _WizzDragTest extends StatefulWidget {
+  const _WizzDragTest({Key? key}) : super(key: key);
+  @override
+  State<_WizzDragTest> createState() => _WizzDragTestState();
+}
+
+class _WizzDragTestState extends State<_WizzDragTest> {
+  String _msg = 'Tap, then tap again and move';
+  DateTime? _lastTapUp;
+  Offset? _lastTapPos;
+  DateTime _downAt = DateTime.now();
+  bool _armed = false, _dragging = false;
+  double _moved = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      onPointerDown: (e) {
+        final now = DateTime.now();
+        _downAt = now;
+        _moved = 0;
+        _armed = false;
+        _dragging = false;
+        final last = _lastTapUp, lastPos = _lastTapPos;
+        if (last != null && lastPos != null) {
+          final ms = now.difference(last).inMilliseconds;
+          final px = (e.localPosition - lastPos).distance.round();
+          setState(() {
+            if (!WizzPrefs.dragOn) {
+              _msg = 'Drag gesture is off';
+            } else if (ms > WizzPrefs.dragMs) {
+              _msg = 'No drag: too slow ($ms ms, limit ${WizzPrefs.dragMs})';
+            } else if (px > WizzPrefs.dragPx) {
+              _msg = 'No drag: too far ($px px, limit ${WizzPrefs.dragPx})';
+            } else {
+              _armed = true;
+              _msg = 'Second touch after $ms ms, $px px away: move to drag';
+            }
+          });
+        }
+      },
+      onPointerMove: (e) {
+        _moved += e.delta.distance;
+        if (_armed && !_dragging && _moved > 4) {
+          setState(() {
+            _dragging = true;
+            _msg = 'Drag started (left button held)';
+          });
+        }
+      },
+      onPointerUp: (e) {
+        final dur = DateTime.now().difference(_downAt).inMilliseconds;
+        if (_dragging) {
+          setState(() => _msg = 'Drag ended (button released)');
+          _lastTapUp = null;
+          return;
+        }
+        if (_moved < 18 && dur < 300) {
+          _lastTapUp = DateTime.now();
+          _lastTapPos = e.localPosition;
+          if (!_armed) setState(() => _msg = 'Tap (click)');
+        } else {
+          _lastTapUp = null;
+          if (!_armed) setState(() => _msg = 'Moved the cursor (no drag)');
+        }
+      },
+      child: Container(
+        height: 140,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.black26,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Text(_msg, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------- auto-close picker
+Future<void> wizzPickAutoClose(BuildContext context) async {
+  final v = await showDialog<int>(
+    context: context,
+    builder: (ctx) => SimpleDialog(
+      title: const Text('Auto-close in background'),
+      children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(24, 0, 24, 8),
+          child: Text('Disconnects every PC and closes the app after this long in the '
+              'background. A file copy or download keeps it open until it finishes.'),
+        ),
+        for (final m in const [0, 5, 10, 15, 30, 60])
+          RadioListTile<int>(
+            title: Text(m == 0 ? 'Off' : '$m min'),
+            value: m,
+            groupValue: WizzPrefs.autoCloseMin,
+            onChanged: (x) => Navigator.pop(ctx, x),
+          ),
+      ],
+    ),
+  );
+  if (v != null) {
+    WizzPrefs.autoCloseMin = v;
+    showToast(v == 0 ? 'Auto-close off' : 'Auto-close after $v min in the background');
+  }
+}
+
+// ------------------------------------------------ transfers, hold, paste
+/// Sessions with a file copy/download running (keeps auto-close away).
+final Set<Object> wizzTransfers = {};
+
+final Map<Object, bool> _wizzHeld = {};
+bool wizzHeld(FFI f) => _wizzHeld[f] == true;
+
+void wizzToggleHold(FFI f) {
+  final on = !wizzHeld(f);
+  _wizzHeld[f] = on;
+  if (on) {
+    f.inputModel.tapDown(MouseButtons.left);
+  } else {
+    f.inputModel.tapUp(MouseButtons.left);
+  }
+}
+
+final Map<Object, bool> _wizzPasting = {};
+
+/// Types the phone's clipboard on the PC, a few characters at a time.
+Future<void> wizzPasteClipboard(FFI f) async {
+  if (_wizzPasting[f] == true) {
+    _wizzPasting[f] = false;
+    wizzToast('Paste stopped');
+    return;
+  }
+  final d = await Clipboard.getData(Clipboard.kTextPlain);
+  var t = (d?.text ?? '').replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  while (t.endsWith('\n')) {
+    t = t.substring(0, t.length - 1);
+  }
+  if (t.isEmpty) {
+    wizzToast('Phone clipboard is empty');
+    return;
+  }
+  final chars = t.runes.map((r) => String.fromCharCode(r)).toList();
+  var cut = false;
+  if (chars.length > 5000) {
+    chars.removeRange(5000, chars.length);
+    cut = true;
+  }
+  _wizzPasting[f] = true;
+  final total = chars.length;
+  final real = wizzRealKeys(f.id);
+  var i = 0;
+  var lastToast = DateTime.fromMillisecondsSinceEpoch(0);
+  try {
+    while (i < total && _wizzPasting[f] == true) {
+      final end = i + 4 < total ? i + 4 : total;
+      final part = chars.sublist(i, end).join();
+      if (real) {
+        await wizzTypeReal(f, part);
+      } else {
+        var buf = '';
+        for (final c in part.split('')) {
+          if (c == '\n') {
+            if (buf.isNotEmpty) bind.sessionInputString(sessionId: f.sessionId, value: buf);
+            buf = '';
+            f.inputModel.inputKey('VK_RETURN');
+          } else if (c == '\t') {
+            if (buf.isNotEmpty) bind.sessionInputString(sessionId: f.sessionId, value: buf);
+            buf = '';
+            f.inputModel.inputKey('VK_TAB');
+          } else {
+            buf += c;
+          }
+        }
+        if (buf.isNotEmpty) bind.sessionInputString(sessionId: f.sessionId, value: buf);
+      }
+      i = end;
+      final now = DateTime.now();
+      if (total > 40 && now.difference(lastToast).inMilliseconds > 700) {
+        lastToast = now;
+        wizzToast('Pasting… $i/$total  (tap Paste to stop)');
+      }
+      await Future.delayed(const Duration(milliseconds: 60));
+    }
+    if (_wizzPasting[f] == true && total > 40) {
+      wizzToast(cut ? 'Pasted the first 5000 characters' : 'Pasted $total characters');
+    }
+  } finally {
+    _wizzPasting[f] = false;
+  }
+}
+
+// ------------------------------------------------------ real key presses
+bool wizzRealKeys(String id) => id.isNotEmpty && WizzPrefs.realKeys.contains(id);
+
+const String _kWizzShiftFrom = '~!@#\$%^&*()_+{}|:"<>?';
+const String _kWizzShiftTo = '`1234567890-=[]\\;\',./';
+
+int? _wizzHidFor(String c) {
+  final u = c.codeUnitAt(0);
+  if (u >= 0x61 && u <= 0x7a) return 0x04 + (u - 0x61); // a-z
+  if (u >= 0x31 && u <= 0x39) return 0x1E + (u - 0x31); // 1-9
+  switch (c) {
+    case '0':
+      return 0x27;
+    case '\n':
+      return 0x28;
+    case '\t':
+      return 0x2B;
+    case ' ':
+      return 0x2C;
+    case '-':
+      return 0x2D;
+    case '=':
+      return 0x2E;
+    case '[':
+      return 0x2F;
+    case ']':
+      return 0x30;
+    case '\\':
+      return 0x31;
+    case ';':
+      return 0x33;
+    case '\'':
+      return 0x34;
+    case '`':
+      return 0x35;
+    case ',':
+      return 0x36;
+    case '.':
+      return 0x37;
+    case '/':
+      return 0x38;
+  }
+  return null;
+}
+
+final Set<String> _wizzMapMode = {};
+
+/// Sends text as the actual keys (like a hardware keyboard / AnyDesk), for
+/// viewers that forward key codes (Gizmo's remote, VNC, VM consoles).
+/// Characters without a US key go as normal text.
+Future<void> wizzTypeReal(FFI f, String text) async {
+  final sid = f.sessionId.toString();
+  if (_wizzMapMode.add(sid)) {
+    bind.sessionSetKeyboardMode(sessionId: f.sessionId, value: 'map');
+  }
+  final im = f.inputModel;
+  var n = 0;
+  for (final r in text.runes) {
+    final orig = String.fromCharCode(r);
+    if (orig == '\r') continue;
+    var c = orig;
+    var shift = false;
+    final si = _kWizzShiftFrom.indexOf(c);
+    if (si >= 0) {
+      c = _kWizzShiftTo[si];
+      shift = true;
+    } else if (r >= 0x41 && r <= 0x5a) {
+      c = c.toLowerCase();
+      shift = true;
+    }
+    final hid = c.length == 1 ? _wizzHidFor(c) : null;
+    if (hid == null) {
+      bind.sessionInputString(sessionId: f.sessionId, value: orig);
+      continue;
+    }
+    if (shift) im.newKeyboardMode('', 0xE1, true, false);
+    im.newKeyboardMode('', hid, true, false);
+    im.newKeyboardMode('', hid, false, false);
+    if (shift) im.newKeyboardMode('', 0xE1, false, false);
+    if (++n % 8 == 0) await Future.delayed(const Duration(milliseconds: 20));
+  }
+}
+
+/// Text from the phone keyboard / send box / paste: real keys for PCs set so.
+void wizzSendText(FFI f, String id, String text) {
+  if (wizzRealKeys(id)) {
+    wizzTypeReal(f, text);
+  } else {
+    bind.sessionInputString(sessionId: f.sessionId, value: text);
+  }
+}
+"""
+save(p, s)
+
+# ------------------------------------------------- gestures: drag window
+p = 'flutter/lib/common/widgets/gestures.dart'
+s = load(p)
+s = rep(s, "import 'package:flutter_hbb/common/widgets/remote_input.dart';\n",
+        "import 'package:flutter_hbb/common/widgets/remote_input.dart';\nimport '../../mobile/pages/wizz_settings.dart' show WizzPrefs;\n")
+s = rep(s, "      if (!_firstTap!.isWithinGlobalTolerance(event, kDoubleTapSlop)) {",
+        "      if (!_firstTap!.isWithinGlobalTolerance(event, WizzPrefs.dragSlop)) {")
+s = rep(s, "    _firstTapUpTimer ??= Timer(kDoubleTapTimeout, _reset);",
+        "    _firstTapUpTimer ??= Timer(WizzPrefs.dragTimeout, _reset);")
+s = rep(s, "    _secondTapDownTimer ??= Timer(kDoubleTapTimeout, _resolve);",
+        "    _secondTapDownTimer ??= Timer(WizzPrefs.dragTimeout, _resolve);")
+save(p, s)
+
+# ---------------------------------------------------------- switcher
+p = 'flutter/lib/mobile/pages/wizz_switcher.dart'
+s = load(p)
+s = rep(s, "import 'dart:async';\n", "import 'dart:async';\nimport 'dart:math' as math;\n")
+s = rep(s, """            ListTile(
+              leading: const Icon(Icons.more_horiz),
+              title: const Text('More options', style: white),""", """            Builder(builder: (_) {
+              final l = WizzSessions.to.sessions;
+              final i = WizzSessions.to.current.value;
+              if (i < 0 || i >= l.length) return const SizedBox.shrink();
+              final id = l[i].id;
+              return SwitchListTile(
+                secondary: const Icon(Icons.keyboard_alt_outlined, color: Colors.white),
+                title: const Text('Real key presses (this PC)', style: white),
+                subtitle: const Text('For Gizmo remote, VNC and VM consoles',
+                    style: TextStyle(color: Colors.white70)),
+                value: wizzRealKeys(id),
+                onChanged: (v) {
+                  WizzPrefs.setRealKeys(id, v);
+                  Navigator.pop(ctx);
+                },
+              );
+            }),
+            ListTile(
+              leading: const Icon(Icons.more_horiz),
+              title: const Text('More options', style: white),""")
+s += r"""
+
+// ------------------------------------------------ dynamic session toolbar
+/// The toolbar row sized from the space it has: every button gets the same
+/// slot, circles shrink or grow with the screen, and buttons that don't fit
+/// move under the ⋮ menu.
+Widget wizzToolbarRow(BuildContext context, double width, Widget collapse,
+    void Function() onMore, List<Widget> all) {
+  final byId = <String, Widget>{};
+  final other = <Widget>[];
+  for (final w in all) {
+    final id = _wizzTbId(w);
+    if (id == null) {
+      other.add(w);
+    } else {
+      byId[id] = w;
+    }
+  }
+  byId.remove('more');
+  final hiddenIds = WizzPrefs.tbHidden;
+  final visible = <Widget>[];
+  final hidden = <MapEntry<String, Widget>>[];
+  for (final id in WizzPrefs.tbOrder) {
+    final w = byId.remove(id);
+    if (w == null) continue;
+    if (hiddenIds.contains(id)) {
+      hidden.add(MapEntry(id, w));
+    } else {
+      visible.add(w);
+    }
+  }
+  visible.addAll(byId.values);
+  visible.addAll(other);
+
+  const margin = 6.0, minSlot = 40.0, maxCircle = 50.0;
+  final avail = math.max(0.0, width - 2 * margin);
+  var cap = (avail / minSlot).floor() - 2; // room for ⋮ and the arrow
+  if (cap < 1) cap = 1;
+  while (visible.length > cap) {
+    final w = visible.removeLast();
+    hidden.insert(0, MapEntry(_wizzTbId(w) ?? '', w));
+  }
+  final frost = WizzPrefs.tbFloat && wizzFrosted(WizzPrefs.tbSeeThrough);
+  final moreBtn = IconButton(
+    color: Colors.white,
+    icon: const Icon(Icons.more_vert),
+    onPressed: () {
+      if (hidden.isEmpty && WizzSessions.to.sessions.length < 2) {
+        onMore();
+      } else {
+        _wizzMoreSheet(context, hidden, onMore);
+      }
+    },
+  );
+  final cells = <Widget>[...visible, moreBtn, collapse];
+  final slot = cells.isEmpty ? avail : avail / cells.length;
+  final circle = (slot - 6).clamp(30.0, maxCircle);
+  Widget cell(Widget w) {
+    Widget c = SizedBox.square(
+        dimension: circle, child: FittedBox(fit: BoxFit.contain, child: w));
+    if (frost) {
+      c = DecoratedBox(
+          decoration: const BoxDecoration(color: kWizzFrost, shape: BoxShape.circle),
+          child: c);
+    }
+    return SizedBox(width: slot, child: Center(child: c));
+  }
+
+  return Padding(
+    padding: const EdgeInsets.symmetric(horizontal: margin),
+    child: Row(mainAxisSize: MainAxisSize.max, children: [for (final w in cells) cell(w)]),
+  );
+}
+
+// ---------------------------------------------- keyboard button with fan
+const _kWizzFanModes = ['normal', 'nopred', 'send'];
+const _kWizzFanIcons = [Icons.keyboard, Icons.speaker_notes_off, Icons.send];
+
+/// Tap: the default keyboard. Hold: three bubbles fan out; slide onto one and
+/// let go (or let go without moving and tap one).
+class WizzKbFan extends StatefulWidget {
+  final String mode;
+  final Widget icon;
+  final VoidCallback onTap;
+  final void Function(String mode) onPick;
+  const WizzKbFan(
+      {Key? key,
+      required this.mode,
+      required this.icon,
+      required this.onTap,
+      required this.onPick})
+      : super(key: key);
+
+  @override
+  State<WizzKbFan> createState() => _WizzKbFanState();
+}
+
+class _WizzKbFanState extends State<WizzKbFan> {
+  static const double _r = 26;
+  OverlayEntry? _e;
+  int _hot = -1;
+  bool _sticky = false, _moved = false;
+  Offset _start = Offset.zero;
+  List<Offset> _pos = const [];
+
+  void _open(Offset g) {
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final c = box.localToGlobal(box.size.center(Offset.zero));
+    final sz = MediaQuery.of(context).size;
+    final up = c.dy > sz.height / 2;
+    const rad = 92.0;
+    final angles = up ? const [-150.0, -90.0, -30.0] : const [150.0, 90.0, 30.0];
+    _pos = [
+      for (final a in angles)
+        Offset(
+            (c.dx + rad * math.cos(a * math.pi / 180)).clamp(_r + 4, sz.width - _r - 4),
+            c.dy + rad * math.sin(a * math.pi / 180))
+    ];
+    _hot = -1;
+    _sticky = false;
+    _moved = false;
+    _start = g;
+    _e?.remove();
+    _e = OverlayEntry(builder: _build);
+    Overlay.of(context, rootOverlay: true).insert(_e!);
+    HapticFeedback.mediumImpact();
+  }
+
+  void _close() {
+    _e?.remove();
+    _e = null;
+    _hot = -1;
+    _sticky = false;
+  }
+
+  void _pick(int i) {
+    final m = _kWizzFanModes[i];
+    _close();
+    widget.onPick(m);
+  }
+
+  void _move(Offset g) {
+    if ((g - _start).distance > 12) _moved = true;
+    var best = -1;
+    var bd = 44.0;
+    for (var i = 0; i < _pos.length; i++) {
+      final d = (g - _pos[i]).distance;
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    if (best != _hot) {
+      _hot = best;
+      if (best >= 0) HapticFeedback.selectionClick();
+      _e?.markNeedsBuild();
+    }
+  }
+
+  void _end() {
+    if (_hot >= 0) {
+      _pick(_hot);
+    } else if (!_moved) {
+      _sticky = true;
+      _e?.markNeedsBuild();
+    } else {
+      _close();
+    }
+  }
+
+  Widget _build(BuildContext ctx) {
+    final cur = _kWizzFanModes.indexOf(widget.mode);
+    return Stack(children: [
+      if (_sticky)
+        Positioned.fill(
+            child: GestureDetector(behavior: HitTestBehavior.opaque, onTap: _close)),
+      for (var i = 0; i < _pos.length; i++)
+        Positioned(
+          left: _pos[i].dx - _r,
+          top: _pos[i].dy - _r,
+          child: GestureDetector(
+            onTap: _sticky ? () => _pick(i) : null,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0, end: i == _hot ? 1.22 : 1.0),
+              duration: const Duration(milliseconds: 140),
+              builder: (_, sc, child) => Transform.scale(scale: sc, child: child),
+              child: Container(
+                width: _r * 2,
+                height: _r * 2,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: i == _hot ? WizzSkin.current.accent : const Color(0xD9303030),
+                  border: Border.all(
+                      color: i == cur ? Colors.greenAccent : Colors.white30,
+                      width: i == cur ? 2.5 : 1),
+                ),
+                child: Icon(_kWizzFanIcons[i], color: Colors.white, size: 26),
+              ),
+            ),
+          ),
+        ),
+      if (_hot >= 0 && _hot < _pos.length)
+        Positioned(
+          left: _pos[_hot].dx - 100,
+          width: 200,
+          top: _pos[_hot].dy - _r - 44,
+          child: IgnorePointer(
+            child: Center(
+              child: Material(
+                color: Colors.transparent,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                      color: Colors.black87, borderRadius: BorderRadius.circular(12)),
+                  child: Text(kWizzKbNames[_kWizzFanModes[_hot]] ?? '',
+                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+                ),
+              ),
+            ),
+          ),
+        ),
+    ]);
+  }
+
+  @override
+  void dispose() {
+    _e?.remove();
+    _e = null;
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onLongPressStart: (d) => _open(d.globalPosition),
+      onLongPressMoveUpdate: (d) => _move(d.globalPosition),
+      onLongPressEnd: (_) => _end(),
+      child: IconButton(
+        color: Colors.white,
+        icon: widget.icon,
+        onPressed: () {
+          if (_e != null) {
+            _close();
+            return;
+          }
+          widget.onTap();
+        },
+      ),
+    );
+  }
+}
+"""
+save(p, s)
+
+# ------------------------------------------- sessions host: auto-close
+p = 'flutter/lib/mobile/pages/wizz_sessions.dart'
+s = load(p)
+s = rep(s, "import 'wizz_switcher.dart';\n",
+        "import 'wizz_switcher.dart';\nimport 'wizz_settings.dart' show WizzPrefs, wizzTransfers;\n")
+s = rep(s, "import 'package:flutter/material.dart';\n", "import 'dart:async';\nimport 'package:flutter/material.dart';\n")
+s = rep(s, """  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) wizzTakeNotificationAction();
+  }
+""", """  Timer? _idleWarn, _idleClose;
+  bool _idleWarned = false;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _idleStop();
+      wizzTakeNotificationAction();
+    } else if (state == AppLifecycleState.paused) {
+      _idleStart();
+    }
+  }
+
+  // Background auto-close: a warning 60 s before, then everything closes and
+  // the app exits. A running file copy/download postpones it.
+  void _idleStart() {
+    _idleStop();
+    final min = WizzPrefs.autoCloseMin;
+    if (min <= 0 || m.sessions.isEmpty) return;
+    _idleWarn = Timer(Duration(minutes: min) - const Duration(seconds: 60), _idleWarnNow);
+  }
+
+  void _idleWarnNow() {
+    if (wizzTransfers.isNotEmpty) {
+      _idleWarn = Timer(const Duration(seconds: 30), _idleWarnNow);
+      return;
+    }
+    _idleWarned = true;
+    gFFI.invokeMethod('wizz_keepalive_warn', {'count': m.sessions.length, 'warn': 60});
+    _idleClose = Timer(const Duration(seconds: 60), _idleCloseNow);
+  }
+
+  void _idleCloseNow() {
+    if (wizzTransfers.isNotEmpty) {
+      _idleWarned = false;
+      gFFI.invokeMethod("wizz_keepalive", m.sessions.length);
+      _idleWarn = Timer(const Duration(seconds: 30), _idleWarnNow);
+      return;
+    }
+    wizzExitApp();
+  }
+
+  void _idleStop() {
+    _idleWarn?.cancel();
+    _idleClose?.cancel();
+    _idleWarn = null;
+    _idleClose = null;
+    if (_idleWarned) {
+      _idleWarned = false;
+      if (m.sessions.isNotEmpty) gFFI.invokeMethod("wizz_keepalive", m.sessions.length);
+    }
+  }
+""")
+s = rep(s, "  void dispose() {\n    WidgetsBinding.instance.removeObserver(this);\n",
+        "  void dispose() {\n    _idleWarn?.cancel();\n    _idleClose?.cancel();\n    WidgetsBinding.instance.removeObserver(this);\n")
+s = rep(s, "/// Original mobile behaviour of closeConnection(): back to the home page.\n",
+        """/// Disconnects everything and closes the app (auto-close).
+void wizzExitApp() {
+  final m = WizzSessions.to;
+  for (final s in m.sessions) {
+    bind.sessionClose(sessionId: s.ffi.sessionId);
+  }
+  m.clear();
+  gFFI.invokeMethod("wizz_keepalive", 0);
+  gFFI.invokeMethod("wizz_exit");
+}
+
+/// Original mobile behaviour of closeConnection(): back to the home page.
+""")
+save(p, s)
+
+# ---------------------------------------------------------- remote page
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+# dynamic toolbar
+s = rep(s, """      child: Row(
+        mainAxisSize: MainAxisSize.max,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: <Widget>[
+          Expanded(
+            child: LayoutBuilder(builder: (context, wizzCons) => FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.center,
+              child: ConstrainedBox(
+              constraints: BoxConstraints(minWidth: wizzCons.maxWidth),
+              child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: wizzArrange(context, () {""", """      child: LayoutBuilder(
+          builder: (context, wizzCons) => wizzToolbarRow(
+              context,
+              wizzCons.maxWidth,
+              Obx(() => IconButton(
+                    color: Colors.white,
+                    icon: Icon(Icons.expand_more),
+                    onPressed: _ffi.ffiModel.waitForFirstImage.isTrue
+                        ? null
+                        : () {
+                            setState(() => _showBar = !_showBar);
+                          },
+                  )), () {""")
+s = rep(s, """                  ])))),
+            ),
+          ),
+          Obx(() => wizzFrostIf(IconButton(
+                color: Colors.white,
+                icon: Icon(Icons.expand_more),
+                onPressed: _ffi.ffiModel.waitForFirstImage.isTrue
+                    ? null
+                    : () {
+                        setState(() => _showBar = !_showBar);
+                      },
+              ))),
+        ],
+      )),""", """                  ])),
+      ),""")
+s = rep(s, "                      icon: const Icon(Icons.minimize),\n", "                      icon: const Icon(Icons.remove),\n")
+s = rep(s, """      Positioned(
+        right: -5,
+        bottom: -5,""", """      Positioned(
+        right: -6,
+        top: -6,""")
+# keyboard fan
+s = rep(s, """                              wizzTb('keyboard', GestureDetector(
+                                  onLongPress: _wizzKeyboardMenu,
+                                  child: IconButton(
+                                  color: Colors.white,
+                                  icon: _wizzKbIcon(),
+                                  onPressed: () => _wizzOpenKb(_wizzKbMode)))),""", """                              wizzTb('keyboard', WizzKbFan(
+                                  mode: _wizzKbMode,
+                                  icon: _wizzKbIcon(),
+                                  onTap: () => _wizzOpenKb(_wizzKbMode),
+                                  onPick: (m) {
+                                    setState(() => _wizzKbMode = m);
+                                    _wizzOpenKb(m);
+                                  })),""", count=2)
+# no-predictions methods
+s = rep(s, """                      enableIMEPersonalizedLearning:
+                          _wizzKbMode != 'nopred' || WizzPrefs.kbNoPredAlt,""", """                      enableIMEPersonalizedLearning: _wizzKbMode != 'nopred' ||
+                          WizzPrefs.kbNoPredMethod != 'incognito',""")
+s = rep(s, "                      keyboardType: _wizzKbMode == 'nopred' && WizzPrefs.kbNoPredAlt\n",
+        "                      keyboardType: _wizzKbMode == 'nopred' &&\n                              WizzPrefs.kbNoPredMethod == 'password'\n")
+# text goes as real key presses for PCs set so
+s = rep(s, """  void inputChar(String char) {
+    if (!inputModel.keyboardInputAllowed) {
+      return;
+    }
+""", """  void inputChar(String char) {
+    if (!inputModel.keyboardInputAllowed) {
+      return;
+    }
+    if (wizzRealKeys(widget.id)) {
+      wizzTypeReal(_ffi, char);
+      return;
+    }
+""")
+n_before = s.count("bind.sessionInputString(sessionId: sessionId, value: ")
+s = _re20.sub(r"bind\.sessionInputString\(sessionId: sessionId, value: (\w+)\);",
+              r"wizzSendText(_ffi, widget.id, \1);", s)
+assert n_before >= 3, n_before
+# Win: tap = Start, hold = arm for combinations; Hold key state
+s = rep(s, """  Widget wrap(String text, void Function() onPressed,
+      {bool? active, IconData? icon}) {
+    return TextButton(""", """  Widget wrap(String text, void Function() onPressed,
+      {bool? active, IconData? icon, void Function()? onLongPress}) {
+    return TextButton(
+        onLongPress: onLongPress,""")
+s = rep(s, """      wrap(isMac ? ' Cmd ' : ' Win ', () {
+        setState(() => inputModel.command = !inputModel.command);
+      }, active: inputModel.command),""", """      wrap(isMac ? ' Cmd ' : ' Win ', () {
+        setState(() {
+          inputModel.command = false;
+          inputModel.inputKey('Meta');
+        });
+      }, active: inputModel.command, onLongPress: () {
+        setState(() => inputModel.command = !inputModel.command);
+      }),""")
+s = rep(s, """        case 'win':
+          on = inputModel.command;
+          break;
+      }
+      out.add(wrap(k.icon != null ? '' : k.label,
+          () => setState(() => k.run(_ffi, isMac)),
+          active: on, icon: k.icon));""", """        case 'win':
+          on = inputModel.command;
+          break;
+        case 'hold':
+          on = wizzHeld(_ffi);
+          break;
+      }
+      out.add(wrap(k.icon != null ? '' : k.label,
+          () => setState(() => k.run(_ffi, isMac)),
+          active: on,
+          icon: k.icon,
+          onLongPress: id == 'win'
+              ? () => setState(() => inputModel.command = !inputModel.command)
+              : null));""")
+# file transfers keep auto-close away
+s = rep(s, """    final st = (m['state'] ?? 'idle').toString();
+""", """    final st = (m['state'] ?? 'idle').toString();
+    if (st == 'idle' || st == 'done' || st == 'error' || st == 'clear') {
+      wizzTransfers.remove(_ffi);
+    } else {
+      wizzTransfers.add(_ffi);
+    }
+""")
+s = rep(s, "    _wizzPillTimer?.cancel();\n    _wizzComposeCtl.dispose();\n", "    _wizzPillTimer?.cancel();\n    wizzTransfers.remove(_ffi);\n    _wizzComposeCtl.dispose();\n")
+save(p, s)
+
+# ---------------------------------------------------------- peer card
+p = 'flutter/lib/common/widgets/peer_card.dart'
+s = load(p)
+s = rep(s, "import '../../mobile/pages/wizz_switcher.dart';\n",
+        "import '../../mobile/pages/wizz_switcher.dart';\nimport '../../mobile/pages/wizz_settings.dart' show WizzPrefs, wizzRealKeys;\n")
+s = rep(s, """            proc: () => wizzDisconnectId(peer.id),
+            padding: menuPadding,
+            dismissOnClicked: true,
+          ));
+    }
+""", """            proc: () => wizzDisconnectId(peer.id),
+            padding: menuPadding,
+            dismissOnClicked: true,
+          ));
+    }
+    if (isAndroid) {
+      menuItems.add(MenuEntryButton<String>(
+        childBuilder: (TextStyle? style) => Text(
+            wizzRealKeys(peer.id)
+                ? 'Keyboard: real key presses ✓'
+                : 'Keyboard: real key presses',
+            style: style),
+        proc: () {
+          final on = !wizzRealKeys(peer.id);
+          WizzPrefs.setRealKeys(peer.id, on);
+          showToast(on
+              ? 'Real key presses on for this PC'
+              : 'Real key presses off for this PC');
+        },
+        padding: menuPadding,
+        dismissOnClicked: true,
+      ));
+    }
+""")
+save(p, s)
+
+# ---------------------------------------------------------- Kotlin
+p = kt + 'WizzKeepAliveService.kt'
+s = load(p)
+s = rep(s, "        val n = intent?.getIntExtra(\"count\", 1) ?: 1\n",
+        "        val n = intent?.getIntExtra(\"count\", 1) ?: 1\n        val warn = intent?.getIntExtra(\"warn\", 0) ?: 0\n")
+s = rep(s, "            .setContentText(if (n == 1) \"Connected to 1 PC\" else \"Connected to $n PCs\")\n",
+        "            .setContentText(if (warn > 0) \"Closing in $warn s · tap to stay connected\" else if (n == 1) \"Connected to 1 PC\" else \"Connected to $n PCs\")\n")
+s = rep(s, "            .addAction(0, \"Disconnect all\", closeAll)\n",
+        "            .addAction(0, \"Disconnect all\", closeAll)\n            .also { if (warn > 0) it.addAction(0, \"Keep connected\", open) }\n")
+save(p, s)
+
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, '                "wizz_keepalive" -> {\n', """                "wizz_keepalive_warn" -> {
+                    try {
+                        val n = call.argument<Int>("count") ?: 1
+                        val w = call.argument<Int>("warn") ?: 0
+                        val i = Intent(this, WizzKeepAliveService::class.java)
+                        i.putExtra("count", n)
+                        i.putExtra("warn", w)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "keepalive warn: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_exit" -> {
+                    result.success(true)
+                    try {
+                        stopService(Intent(this, WizzKeepAliveService::class.java))
+                    } catch (e: Exception) {
+                    }
+                    finishAndRemoveTask()
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        Runtime.getRuntime().exit(0)
+                    }, 400)
+                }
+                "wizz_keepalive" -> {
 """)
 save(p, s)
 
