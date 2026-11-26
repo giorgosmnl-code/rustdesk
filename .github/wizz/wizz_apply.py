@@ -8380,4 +8380,355 @@ Future<bool> wizzOkToClose(BuildContext? context, Iterable<WizzSession> list) as
 """
 save(p, s)
 
+
+# ===== Wizz #23e: session recording (hold the camera button) =====
+import os as _os28
+p = 'flutter/lib/mobile/pages/wizz_settings.dart'
+s = load(p)
+s += r"""
+
+// ------------------------------------------------------------ recording
+/// PCs being recorded, with the start time.
+final Map<Object, DateTime> wizzRecording = {};
+final Map<Object, String> _wizzRecTitles = {};
+final Map<Object, String> _wizzRecCodec = {};
+/// Called when a recording stops, so a background PC can go quiet again.
+final Map<Object, VoidCallback> wizzRecHooks = {};
+/// Bumped whenever a recording starts or stops.
+final ValueNotifier<int> wizzRecRev = ValueNotifier(0);
+String? _wizzRecDir;
+
+String _wizzPcTitle(FFI f) {
+  try {
+    final a = bind.mainGetPeerOptionSync(id: f.id, key: 'alias');
+    if (a.isNotEmpty) return a;
+  } catch (_) {}
+  return f.id;
+}
+
+String wizzDur(Duration d) {
+  final m = d.inMinutes, sec = d.inSeconds % 60;
+  final h = d.inHours;
+  if (h > 0) return '$h:${(m % 60).toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
+  return '$m:${sec.toString().padLeft(2, '0')}';
+}
+
+void _wizzRecNotify() {
+  wizzRecRev.value++;
+  var title = '';
+  var since = 0;
+  if (wizzRecording.isNotEmpty) {
+    final e = wizzRecording.entries.first;
+    since = e.value.millisecondsSinceEpoch;
+    title = _wizzRecTitles[e.key] ?? 'PC';
+    if (wizzRecording.length > 1) title = '$title +${wizzRecording.length - 1}';
+  }
+  gFFI.invokeMethod('wizz_keepalive_rec', {'rec': title, 'since': since});
+}
+
+/// Hold the camera button: records the PC's screen to Movies/RustDesk.
+Future<void> wizzRecordStart(FFI f) async {
+  if (wizzRecording.containsKey(f)) return;
+  if (f.ffiModel.permissions['recording'] == false) {
+    wizzToast('This PC doesn\'t allow recording');
+    return;
+  }
+  var dir = '/storage/emulated/0/Movies/RustDesk';
+  try {
+    await Directory(dir).create(recursive: true);
+    final t = File('$dir/.wizz_test');
+    await t.writeAsString('x');
+    await t.delete();
+  } catch (_) {
+    try {
+      final d = await getExternalStorageDirectory();
+      if (d != null) {
+        dir = '${d.path}/Recordings';
+        await Directory(dir).create(recursive: true);
+      }
+    } catch (_) {}
+  }
+  _wizzRecDir = dir;
+  await bind.mainSetLocalOption(key: 'video-save-directory', value: dir);
+  final sid = f.sessionId;
+  // the phone can only record VP8/VP9/AV1: switch for the recording
+  final cur = await bind.sessionGetOption(sessionId: sid, arg: 'codec-preference') ?? '';
+  if (!(cur == 'vp8' || cur == 'vp9' || cur == 'av1')) {
+    _wizzRecCodec[f] = cur.isEmpty ? 'auto' : cur;
+    await bind.sessionPeerOption(sessionId: sid, name: 'codec-preference', value: 'vp9');
+    bind.sessionChangePreferCodec(sessionId: sid);
+    wizzToast('Starting recording…');
+    await Future.delayed(const Duration(milliseconds: 1500));
+  }
+  final title = _wizzPcTitle(f);
+  _wizzRecTitles[f] = title;
+  wizzRecording[f] = DateTime.now();
+  try {
+    final pi = f.ffiModel.pi;
+    await sessionRefreshVideo(sid, pi);
+    await bind.sessionRecordScreen(sessionId: sid, start: true);
+  } catch (e) {
+    wizzRecording.remove(f);
+    wizzToast('Recording failed to start');
+    _wizzRecNotify();
+    return;
+  }
+  HapticFeedback.mediumImpact();
+  wizzToast('● Recording $title');
+  _wizzRecNotify();
+}
+
+/// Stops recording a PC and saves the file (also when the PC is closing).
+Future<void> wizzRecordStop(FFI f, {bool closing = false}) async {
+  final since = wizzRecording.remove(f);
+  if (since == null) return;
+  final title = _wizzRecTitles.remove(f) ?? 'PC';
+  try {
+    await bind.sessionRecordScreen(sessionId: f.sessionId, start: false);
+  } catch (_) {}
+  final old = _wizzRecCodec.remove(f);
+  if (old != null) {
+    try {
+      await bind.sessionPeerOption(sessionId: f.sessionId, name: 'codec-preference', value: old);
+      if (!closing) bind.sessionChangePreferCodec(sessionId: f.sessionId);
+    } catch (_) {}
+  }
+  _wizzRecNotify();
+  final hook = wizzRecHooks[f];
+  if (hook != null) hook();
+  HapticFeedback.lightImpact();
+  await Future.delayed(const Duration(milliseconds: 900));
+  final dir = _wizzRecDir;
+  File? newest;
+  DateTime? newestAt;
+  if (dir != null) {
+    try {
+      for (final e in Directory(dir).listSync()) {
+        if (e is! File) continue;
+        final low = e.path.toLowerCase();
+        if (!low.endsWith('.webm') && !low.endsWith('.mp4')) continue;
+        final m = e.lastModifiedSync();
+        if (m.isBefore(since.subtract(const Duration(seconds: 5)))) continue;
+        if (newestAt == null || m.isAfter(newestAt)) {
+          newest = e;
+          newestAt = m;
+        }
+      }
+    } catch (_) {}
+  }
+  if (newest == null) {
+    wizzToast('Recording of $title stopped, but no file was saved');
+    return;
+  }
+  final path = newest.path;
+  final dur = wizzDur(DateTime.now().difference(since));
+  gFFI.invokeMethod('wizz_media_scan', path);
+  gFFI.invokeMethod('wizz_dl_notify', {
+    'state': 'done',
+    'nid': 7322,
+    'title': 'Recording of $title saved ($dur)',
+    'text': '${path.replaceFirst('/storage/emulated/0/', '')} · tap to open',
+    'progress': 100,
+    'path': path,
+    'share': true,
+  });
+  wizzToast('Recording saved ($dur) to ${path.replaceFirst('/storage/emulated/0/', '')}');
+}
+
+/// "● REC 0:42" chips at the top; tap one to stop that recording.
+class WizzRecChip extends StatelessWidget {
+  const WizzRecChip({Key? key}) : super(key: key);
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<int>(
+      valueListenable: wizzRecRev,
+      builder: (context, _, __) {
+        if (wizzRecording.isEmpty) return const SizedBox.shrink();
+        return Positioned(
+          top: MediaQuery.of(context).padding.top + 8,
+          left: 0,
+          right: 0,
+          child: Center(
+            child: StreamBuilder<int>(
+              stream: Stream.periodic(const Duration(seconds: 1), (i) => i),
+              builder: (context, __) => Wrap(spacing: 6, children: [
+                for (final e in wizzRecording.entries.toList())
+                  GestureDetector(
+                    onTap: () => wizzRecordStop(e.key as FFI),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xCC000000),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFFE53935)),
+                      ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        const Icon(Icons.fiber_manual_record, color: Color(0xFFE53935), size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                            'REC ${wizzRecording.length > 1 ? '${_wizzRecTitles[e.key] ?? ''} ' : ''}'
+                            '${wizzDur(DateTime.now().difference(e.value))}  ■',
+                            style: const TextStyle(color: Colors.white, fontSize: 13)),
+                      ]),
+                    ),
+                  ),
+              ]),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+"""
+save(p, s)
+
+# camera button: tap = screenshot (or stop while recording), hold = record
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, """                    wizzTb('shot', IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.photo_camera_outlined),
+                      onPressed: () => wizzScreenshot(_ffi),
+                    )),""", """                    wizzTb('shot', ValueListenableBuilder<int>(
+                      valueListenable: wizzRecRev,
+                      builder: (context, _, __) {
+                        final rec = wizzRecording.containsKey(_ffi);
+                        return GestureDetector(
+                          onLongPress: () => rec
+                              ? wizzRecordStop(_ffi)
+                              : wizzRecordStart(_ffi),
+                          child: IconButton(
+                            color: rec ? const Color(0xFFFF5252) : Colors.white,
+                            icon: Icon(rec
+                                ? Icons.stop_circle_outlined
+                                : Icons.photo_camera_outlined),
+                            onPressed: () => rec
+                                ? wizzRecordStop(_ffi)
+                                : wizzScreenshot(_ffi),
+                          ),
+                        );
+                      },
+                    )),""")
+s = rep(s, "            if (widget.active) const WizzFlash(),\n",
+        "            if (widget.active) const WizzFlash(),\n            if (widget.active) const WizzRecChip(),\n")
+# a recorded PC keeps full speed in the background
+s = rep(s, """    _wizzIsBg = bg;
+    // file downloads use the clipboard channel: keep it while one runs""", """    _wizzIsBg = bg;
+    if (bg && wizzRecording.containsKey(_ffi)) {
+      // being recorded: stay at full speed until the recording stops
+      wizzRecHooks[_ffi] = () {
+        if (mounted && _wizzIsBg) _wizzBackground(true);
+      };
+      return;
+    }
+    // file downloads use the clipboard channel: keep it while one runs""")
+s = rep(s, "    _wizzPillTimer?.cancel();\n    wizzTransfers.remove(_ffi);\n",
+        "    _wizzPillTimer?.cancel();\n    wizzTransfers.remove(_ffi);\n    wizzRecHooks.remove(_ffi);\n    if (wizzRecording.containsKey(_ffi)) wizzRecordStop(_ffi, closing: true);\n")
+save(p, s)
+
+# auto-close waits for recordings too
+p = 'flutter/lib/mobile/pages/wizz_sessions.dart'
+s = load(p)
+s = rep(s, "import 'wizz_settings.dart' show WizzPrefs, wizzTransfers;\n",
+        "import 'wizz_settings.dart' show WizzPrefs, wizzTransfers, wizzRecording;\n")
+n = s.count("    if (wizzTransfers.isNotEmpty) {\n")
+assert n == 2, n
+s = s.replace("    if (wizzTransfers.isNotEmpty) {\n",
+              "    if (wizzTransfers.isNotEmpty || wizzRecording.isNotEmpty) {\n")
+save(p, s)
+
+# disconnect warnings and the notification's Stop recording
+p = 'flutter/lib/mobile/pages/wizz_switcher.dart'
+s = load(p)
+s = rep(s, "  final busy = list.where((s) => wizzTransfers.contains(s.ffi)).toList();",
+        "  final busy = list\n      .where((s) => wizzTransfers.contains(s.ffi) || wizzRecording.containsKey(s.ffi))\n      .toList();")
+s = rep(s, """      title: const Text('File transfer running'),
+      content: Text('A download from $names is still running. '
+          'Disconnecting will stop it.'),""", """      title: const Text('Still busy'),
+      content: Text('A download or recording on $names is still running. '
+          'Disconnecting stops it (a recording is saved).'),""")
+s = rep(s, "      content: WizzSessions.to.sessions.any((s) => wizzTransfers.contains(s.ffi))\n          ? const Text('A file download is still running and will be stopped.',",
+        "      content: WizzSessions.to.sessions.any((s) =>\n              wizzTransfers.contains(s.ffi) || wizzRecording.containsKey(s.ffi))\n          ? const Text('A download or recording is still running and will be stopped.',")
+s = rep(s, """    } else if (a == 'closeall') {""", """    } else if (a == 'recstop') {
+      for (final f in wizzRecording.keys.toList()) {
+        wizzRecordStop(f as FFI);
+      }
+    } else if (a == 'closeall') {""")
+save(p, s)
+
+# Kotlin: the sessions notification becomes the recording notification
+p = kt + 'WizzKeepAliveService.kt'
+s = load(p)
+s = rep(s, """class WizzKeepAliveService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+""", """class WizzKeepAliveService : Service() {
+    companion object {
+        @JvmStatic var recTitle = ""
+        @JvmStatic var recSince = 0L
+        @JvmStatic var lastCount = 1
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+""")
+s = rep(s, "        val n = intent?.getIntExtra(\"count\", 1) ?: 1\n",
+        "        val n = (intent?.getIntExtra(\"count\", -1) ?: -1).let { if (it > 0) it else lastCount }\n        lastCount = n\n        val rec = recTitle.isNotEmpty()\n")
+s = rep(s, """        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {""", """        val recStop = PendingIntent.getActivity(
+            this, 2,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra("wizz_action", "recstop"),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {""")
+s = rep(s, """            .setSmallIcon(R.mipmap.ic_stat_logo)
+            .setContentTitle(getString(R.string.app_name))""", """            .setSmallIcon(if (rec) R.drawable.wizz_rec else R.mipmap.ic_stat_logo)
+            .setContentTitle(if (rec) "● Recording $recTitle" else getString(R.string.app_name))""")
+s = rep(s, """            .also { if (warn > 0) it.addAction(0, "Keep connected", open) }""", """            .also { if (warn > 0) it.addAction(0, "Keep connected", open) }
+            .also {
+                if (rec) {
+                    it.addAction(0, "Stop recording", recStop)
+                    it.setUsesChronometer(true)
+                    it.setWhen(recSince)
+                    it.setShowWhen(true)
+                    it.setColor(0xFFE53935.toInt())
+                }
+            }""")
+save(p, s)
+
+p = kt + 'MainActivity.kt'
+s = load(p)
+s = rep(s, '                "wizz_keepalive_warn" -> {\n', """                "wizz_keepalive_rec" -> {
+                    try {
+                        WizzKeepAliveService.recTitle = call.argument<String>("rec") ?: ""
+                        WizzKeepAliveService.recSince =
+                            (call.argument<Number>("since") ?: 0).toLong()
+                        val i = Intent(this, WizzKeepAliveService::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+                    } catch (e: Exception) {
+                        Log.e("Wizz", "keepalive rec: $e")
+                    }
+                    result.success(true)
+                }
+                "wizz_keepalive_warn" -> {
+""")
+save(p, s)
+
+p = 'flutter/android/app/src/main/res/drawable/wizz_rec.xml'
+_os28.makedirs(_os28.path.dirname(p), exist_ok=True)
+save(p, '''<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,2A10,10 0,1 0,12 22A10,10 0,1 0,12 2ZM12,4A8,8 0,1 1,12 20A8,8 0,1 1,12 4Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,7A5,5 0,1 0,12 17A5,5 0,1 0,12 7Z" />
+</vector>
+''')
+
 print('wizz multi-session patch applied')
