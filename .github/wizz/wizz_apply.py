@@ -8281,4 +8281,103 @@ s = _re20.sub(r"\n(\s*)_wizzClipCall\('wizz-clip-download',",
               lambda m: "\n" + m.group(1) + "wizzTransfers.add(_ffi);\n" + m.group(1) + "_wizzClipCall('wizz-clip-download',", s)
 save(p, s)
 
+
+# ===== Wizz #23d: warn before disconnecting a PC that is still sending a file =====
+p = 'flutter/lib/mobile/pages/wizz_switcher.dart'
+s = load(p)
+s = rep(s, """    if (a == 'return') {
+      wizzReturnToSessions();
+    } else if (a == 'closeall') {
+      wizzCloseAll();
+    }""", """    if (a == 'return') {
+      wizzReturnToSessions();
+    } else if (a == 'closeall') {
+      wizzOkToClose(null, WizzSessions.to.sessions).then((ok) {
+        if (ok && WizzSessions.to.hostMounted) wizzCloseAll();
+      });
+    }""")
+s = rep(s, """void wizzCloseTapped(BuildContext context, void Function() closeOne) {
+  final m = WizzSessions.to;
+  if (m.sessions.length < 2) {
+    closeOne();
+    return;
+  }""", """void wizzCloseTapped(BuildContext context, void Function() closeOne) async {
+  final m = WizzSessions.to;
+  if (m.sessions.length < 2) {
+    if (await wizzOkToClose(context, m.sessions)) closeOne();
+    return;
+  }""")
+s = rep(s, """          title: Text('Close $title'),
+          onTap: () {
+            Navigator.pop(ctx);
+            m.closeAt(m.current.value);
+          },""", """          title: Text('Close $title'),
+          onTap: () async {
+            Navigator.pop(ctx);
+            final i = m.current.value;
+            if (i < 0 || i >= m.sessions.length) return;
+            if (await wizzOkToClose(context, [m.sessions[i]])) {
+              final j = m.sessions.indexOf(m.sessions[i]);
+              if (j >= 0) m.closeAt(j);
+            }
+          },""")
+s = rep(s, """          title: Text('Close all ${m.sessions.length} PCs',
+              style: const TextStyle(color: Colors.redAccent)),
+          onTap: () {
+            Navigator.pop(ctx);
+            wizzCloseAll();
+          },""", """          title: Text('Close all ${m.sessions.length} PCs',
+              style: const TextStyle(color: Colors.redAccent)),
+          onTap: () async {
+            Navigator.pop(ctx);
+            if (await wizzOkToClose(context, m.sessions)) wizzCloseAll();
+          },""")
+s = rep(s, """void wizzDisconnectId(String id) {
+  final m = WizzSessions.to;
+  final i = m.sessions.indexWhere((s) => s.id == id);
+  if (i >= 0) m.closeAt(i);
+}""", """void wizzDisconnectId(String id) async {
+  final m = WizzSessions.to;
+  final i = m.sessions.indexWhere((s) => s.id == id);
+  if (i < 0) return;
+  if (!await wizzOkToClose(null, [m.sessions[i]])) return;
+  final j = m.sessions.indexWhere((s) => s.id == id);
+  if (j >= 0) m.closeAt(j);
+}""")
+s = rep(s, """      title: Text(n == 1 ? 'Disconnect this PC?' : 'Disconnect all $n PCs?'),
+      actions: [""", """      title: Text(n == 1 ? 'Disconnect this PC?' : 'Disconnect all $n PCs?'),
+      content: WizzSessions.to.sessions.any((s) => wizzTransfers.contains(s.ffi))
+          ? const Text('A file download is still running and will be stopped.',
+              style: TextStyle(color: Colors.orange))
+          : null,
+      actions: [""")
+s += r"""
+
+/// Asks before disconnecting PCs that are still sending a file to the phone.
+/// Returns true when it is fine to go ahead.
+Future<bool> wizzOkToClose(BuildContext? context, Iterable<WizzSession> list) async {
+  final busy = list.where((s) => wizzTransfers.contains(s.ffi)).toList();
+  if (busy.isEmpty) return true;
+  final ctx = (context != null && context.mounted) ? context : globalKey.currentContext;
+  if (ctx == null) return true;
+  final names = busy.map((s) => s.title).join(', ');
+  final ok = await showDialog<bool>(
+    context: ctx,
+    builder: (c) => AlertDialog(
+      title: const Text('File transfer running'),
+      content: Text('A download from $names is still running. '
+          'Disconnecting will stop it.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Keep connected')),
+        TextButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('Disconnect anyway', style: TextStyle(color: Colors.red))),
+      ],
+    ),
+  );
+  return ok == true;
+}
+"""
+save(p, s)
+
 print('wizz multi-session patch applied')
