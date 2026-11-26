@@ -7411,12 +7411,22 @@ s = rep(s, """            ListTile(
               final i = WizzSessions.to.current.value;
               if (i < 0 || i >= l.length) return const SizedBox.shrink();
               final id = l[i].id;
+              final on = wizzRealKeys(id);
               return SwitchListTile(
-                secondary: const Icon(Icons.keyboard_alt_outlined, color: Colors.white),
-                title: const Text('Real key presses (this PC)', style: white),
-                subtitle: const Text('For Gizmo remote, VNC and VM consoles',
-                    style: TextStyle(color: Colors.white70)),
-                value: wizzRealKeys(id),
+                secondary: Icon(on ? Icons.keyboard_alt : Icons.keyboard_alt_outlined,
+                    color: Colors.white),
+                title: Text(on ? 'Real key presses: ON' : 'Real key presses: off',
+                    style: white.copyWith(fontWeight: on ? FontWeight.bold : FontWeight.normal)),
+                subtitle: Text(
+                    on
+                        ? 'This PC gets real keys (Gizmo remote, VNC, VM consoles)'
+                        : 'For Gizmo remote, VNC and VM consoles',
+                    style: const TextStyle(color: Colors.white70)),
+                activeColor: Colors.white,
+                activeTrackColor: Colors.black45,
+                inactiveThumbColor: Colors.white70,
+                inactiveTrackColor: Colors.black26,
+                value: on,
                 onChanged: (v) {
                   WizzPrefs.setRealKeys(id, v);
                   Navigator.pop(ctx);
@@ -8208,6 +8218,67 @@ s = rep(s, """        padding: menuPadding,
       ));
     }
 """)
+save(p, s)
+
+
+# ===== Wizz #23b: real key presses also for keys the keyboard sends as key events =====
+# In "no predictions" fields keyboards send digits (and some symbols) as key
+# events, not text, so they skipped the real-keys path.
+p = 'flutter/lib/common/widgets/remote_input.dart'
+s = load(p)
+s = rep(s, "import 'package:flutter_hbb/models/input_model.dart';\n",
+        "import 'package:flutter_hbb/models/input_model.dart';\nimport '../../mobile/pages/wizz_settings.dart' show wizzRealKeys, wizzTypeReal;\n")
+s = rep(s, """                : (FocusNode node, KeyEvent event) =>
+                    inputModel.handleKeyEvent(event),""", """                : (FocusNode node, KeyEvent event) =>
+                    _wizzRealKeyEvent(inputModel, event) ??
+                    inputModel.handleKeyEvent(event),""")
+s += r"""
+
+/// For PCs set to "real key presses": printable keys arriving as key events
+/// are typed through the same real-key path as text.
+KeyEventResult? _wizzRealKeyEvent(InputModel im, KeyEvent e) {
+  if (!isAndroid) return null;
+  final f = im.parent.target;
+  if (f == null || !wizzRealKeys(im.id)) return null;
+  final k = HardwareKeyboard.instance;
+  if (k.isControlPressed || k.isAltPressed || k.isMetaPressed) return null;
+  if (im.ctrl || im.alt || im.command) return null;
+  final ch = e.character;
+  if (e is KeyUpEvent) {
+    final l = e.logicalKey.keyLabel;
+    return (l.length == 1 && l.codeUnitAt(0) > 0x20) ? KeyEventResult.handled : null;
+  }
+  if (ch == null || ch.length != 1) return null;
+  final u = ch.codeUnitAt(0);
+  if (u <= 0x20 || u == 0x7f) return null; // space, enter, tab, control keys: normal path
+  wizzTypeReal(f, ch);
+  return KeyEventResult.handled;
+}
+"""
+save(p, s)
+
+
+# ===== Wizz #23c: a download keeps running when you switch to another PC =====
+# Background PCs had their clipboard channel switched off, and file downloads
+# run over that channel, so switching PCs cut the running download.
+p = 'flutter/lib/mobile/pages/remote_page.dart'
+s = load(p)
+s = rep(s, """  Future<void> _wizzSetBackground(bool bg) async {
+    await _wizzSetOff('disable-clipboard', bg);""", """  bool _wizzIsBg = false;
+  Future<void> _wizzSetBackground(bool bg) async {
+    _wizzIsBg = bg;
+    // file downloads use the clipboard channel: keep it while one runs
+    await _wizzSetOff('disable-clipboard', bg && !wizzTransfers.contains(_ffi));""")
+s = rep(s, """    if (st == 'idle' || st == 'done' || st == 'error' || st == 'clear') {
+      wizzTransfers.remove(_ffi);
+    } else {""", """    if (st == 'idle' || st == 'done' || st == 'error' || st == 'clear') {
+      final was = wizzTransfers.remove(_ffi);
+      if (was && _wizzIsBg) _wizzBackground(true); // now it may go quiet
+    } else {""")
+n = s.count("_wizzClipCall('wizz-clip-download',")
+assert n >= 1, n
+s = _re20.sub(r"\n(\s*)_wizzClipCall\('wizz-clip-download',",
+              lambda m: "\n" + m.group(1) + "wizzTransfers.add(_ffi);\n" + m.group(1) + "_wizzClipCall('wizz-clip-download',", s)
 save(p, s)
 
 print('wizz multi-session patch applied')

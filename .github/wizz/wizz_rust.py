@@ -639,6 +639,16 @@ pub fn dismiss(sid: u64) {
 /// Returns "1" with a message to send (files offered), "2" (files are the latest
 /// copy but nothing to do for this PC), or "0" (text is the latest copy).
 pub fn offer(sid: u64) -> (&'static str, Option<Message>) {
+    // a new offer would replace that PC's clipboard and void the files it is
+    // still sending us
+    if remotes()
+        .lock()
+        .unwrap()
+        .get(&sid)
+        .map_or(false, |r| r.state == "downloading")
+    {
+        return ("2", None);
+    }
     let (l, gen) = latest().lock().unwrap().clone();
     let source = match l {
         Latest::Nothing | Latest::Text => return ("0", None),
